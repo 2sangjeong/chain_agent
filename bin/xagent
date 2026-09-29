@@ -1,0 +1,474 @@
+#!/usr/bin/python3
+"""xagent — 외부 코딩 에이전트(opencode) 호출 래퍼. 계약은 ~/xagent/README.md."""
+import argparse
+import json
+import os
+import re
+import signal
+import stat
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from pathlib import Path
+
+import yaml
+
+PRESETS_PATH = Path(os.environ.get("XAGENT_PRESETS", "~/.config/xagent/presets.yaml")).expanduser()
+LOG_DIR = Path("~/.xagent/logs").expanduser()
+KILL_GRACE_SEC = 5
+SEVERITY_RANK = {"high": 3, "med": 2, "low": 1}
+READ_ONLY_DENY = {k: "deny" for k in ("edit", "bash", "webfetch", "task", "external_directory")}
+
+REVIEW_CONTRACT = """\
+You are a code reviewer. Review the diff below for real defects: bugs, off-by-one errors, \
+missing null/None/empty handling, wrong conditions, security problems, broken error handling.
+You may read files in the repository for context. You cannot and must not modify anything.
+
+OUTPUT CONTRACT — your final answer must consist ONLY of lines in this exact format:
+severity|file:line|reason
+- severity is exactly one of: high, med, low
+- file is the path relative to the repository root (as shown in the diff header, without a/ or b/)
+- line is the line number in the NEW version of the file. Each diff line below is prefixed with \
+its new-file line number in the left column; use that number.
+- reason is one short sentence.
+- One finding per line. No headings, no bullets, no code fences, no other text.
+If there are no problems, output exactly one line: LGTM
+"""
+
+
+class UsageError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- presets
+
+def load_presets():
+    try:
+        data = yaml.safe_load(PRESETS_PATH.read_text())
+    except (OSError, yaml.YAMLError) as e:
+        raise UsageError(f"프리셋 파일을 읽을 수 없음: {PRESETS_PATH}: {e}")
+    agents = (data.get("opencode") or {}).get("agents") or {}
+    presets = data.get("presets") or {}
+    for name, p in presets.items():
+        validate_preset(name, p, agents)
+    return presets, agents
+
+
+def validate_preset(name, p, agents):
+    def bad(msg):
+        raise UsageError(f"프리셋 '{name}': {msg}")
+    for key in ("runner", "model", "agent", "mode", "permissions", "timeout_sec"):
+        if key not in p:
+            bad(f"필드 누락: {key}")
+    if p["runner"] != "opencode":
+        bad(f"runner '{p['runner']}' 미지원 (현재 opencode만)")
+    if p["mode"] not in ("review", "task"):
+        bad(f"mode는 review|task: {p['mode']}")
+    if p["permissions"] not in ("read-only", "workspace-write"):
+        bad(f"permissions는 read-only|workspace-write: {p['permissions']}")
+    if p["agent"] not in agents:
+        bad(f"agent '{p['agent']}'가 opencode.agents에 없음")
+    if not isinstance(p["timeout_sec"], (int, float)) or p["timeout_sec"] <= 0:
+        bad("timeout_sec는 양수")
+    perm = agents[p["agent"]].get("permission") or {}
+    if p["permissions"] == "read-only" and not (perm.get("edit") == "deny" and perm.get("bash") == "deny"):
+        bad(f"permissions: read-only인데 agent '{p['agent']}'의 edit/bash가 deny가 아님")
+    if p["mode"] == "review" and p["permissions"] != "read-only":
+        bad("review 모드는 permissions: read-only만 허용")
+    if p["mode"] == "review" and p.get("worktree"):
+        bad("review 모드는 worktree 불가")
+
+
+def get_preset(presets, name):
+    if name not in presets:
+        raise UsageError(f"없는 프리셋: {name} (가능: {', '.join(presets)})")
+    return presets[name]
+
+
+# ---------------------------------------------------------------- helpers
+
+def git(*args, cwd=None, check=True):
+    r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    if check and r.returncode != 0:
+        raise UsageError(f"git {' '.join(args)} 실패: {r.stderr.strip()}")
+    return r.stdout
+
+
+def git_toplevel():
+    r = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True,
+                       stdin=subprocess.DEVNULL)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def readable_stdin():
+    """stdin이 파이프·일반 파일일 때만 읽는다. TTY/소켓/문자장치(/dev/null)는 읽지 않는다."""
+    try:
+        mode = os.fstat(sys.stdin.fileno()).st_mode
+    except (OSError, ValueError):
+        return None
+    if stat.S_ISFIFO(mode) or stat.S_ISREG(mode):
+        return sys.stdin.read()
+    return None
+
+
+def timestamp():
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def log_path(ts, preset):
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    path = LOG_DIR / f"{ts}-{preset}.log"
+    n = 1
+    while path.exists():
+        path = LOG_DIR / f"{ts}-{preset}.log.{n}"
+        n += 1
+    return path
+
+
+# ---------------------------------------------------------------- runner
+
+def build_agent_config(preset, agents):
+    agent = json.loads(json.dumps(agents[preset["agent"]]))  # deep copy
+    if preset["mode"] == "review":
+        # review는 프리셋 내용과 무관하게 읽기 전용을 덮어쓴다 (뒤 규칙이 이긴다)
+        agent["permission"] = {**(agent.get("permission") or {}), **READ_ONLY_DENY}
+    return {"agent": {preset["agent"]: agent}}
+
+
+def run_opencode(name, preset, agents, prompt, cwd, ts):
+    """러너 1회 실행. 결과 dict 반환(status, texts, ...)."""
+    cfg = build_agent_config(preset, agents)
+    cmd = ["opencode", "run", "--pure", "--format", "json", "--agent", preset["agent"], "-m", preset["model"]]
+    env = {
+        **os.environ,
+        "OPENCODE_CONFIG_CONTENT": json.dumps(cfg),
+        "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
+        "OPENCODE_DISABLE_CLAUDE_CODE_SKILLS": "1",
+        "OPENCODE_DISABLE_AUTOUPDATE": "1",
+        "XAGENT_DEPTH": "1",
+    }
+    lp = log_path(ts, name)
+    start = time.monotonic()
+    proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, start_new_session=True)
+    timed_out = False
+    try:
+        out, err = proc.communicate(prompt, timeout=preset["timeout_sec"])
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _kill_group(proc)
+        out, err = proc.communicate()
+    elapsed = time.monotonic() - start
+
+    texts, errors = [], []
+    for line in (out or "").splitlines():
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if ev.get("type") == "text" and (ev.get("part") or {}).get("text"):
+            texts.append(ev["part"]["text"])
+        elif ev.get("type") == "error":
+            errors.append(json.dumps(ev.get("error"), ensure_ascii=False))
+
+    if timed_out:
+        status = "timeout"
+    elif proc.returncode != 0 or errors:
+        status = "runner-error"
+    elif not any(t.strip() for t in texts):
+        status = "empty-output"
+    else:
+        status = "ok"
+
+    return {
+        "preset": name, "status": status, "elapsed": elapsed, "rc": proc.returncode,
+        "texts": texts, "errors": errors, "log": lp,
+        "_log": {"cmd": cmd, "cwd": cwd, "config": cfg, "prompt": prompt, "stdout": out, "stderr": err},
+    }
+
+
+def _kill_group(proc):
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        proc.wait(timeout=KILL_GRACE_SEC)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def write_log(res, extra=None):
+    lg = res["_log"]
+    parts = [
+        f"# xagent log  preset={res['preset']}  status={res['status']}  rc={res['rc']}  elapsed={res['elapsed']:.1f}s",
+        f"# argv: {' '.join(sys.argv)}",
+        f"# cmd: {' '.join(lg['cmd'])}",
+        f"# cwd: {lg['cwd']}",
+        "## injected OPENCODE_CONFIG_CONTENT", json.dumps(lg["config"], ensure_ascii=False, indent=2),
+    ]
+    if extra:
+        parts += ["## result", extra]
+    parts += ["## prompt", lg["prompt"], "## runner stdout (json events)", lg["stdout"] or "",
+              "## runner stderr", lg["stderr"] or ""]
+    res["log"].write_text("\n".join(parts) + "\n")
+
+
+# ---------------------------------------------------------------- review contract
+
+_LINE_RE = re.compile(r"^(high|med|low)\|([^|]+?):(\d+)(?:-\d+)?\|(.+)$")
+_STRIP_PREFIX = re.compile(r"^(?:[-*]\s+|\d+[.)]\s+)")
+
+
+def parse_review(texts):
+    """계약 줄만 남긴다. (findings, lgtm, dropped_lines)"""
+    findings, lgtm, dropped = [], False, []
+    for raw in "\n".join(texts).splitlines():
+        s = raw.strip()
+        if not s:
+            continue
+        s = _STRIP_PREFIX.sub("", s).strip().strip("`").strip()
+        if s == "LGTM":
+            lgtm = True
+            continue
+        m = _LINE_RE.match(s)
+        if not m:
+            dropped.append(raw)
+            continue
+        sev, f, line, reason = m.groups()
+        f = f.strip()
+        for pre in ("./", "a/", "b/"):
+            if f.startswith(pre):
+                f = f[len(pre):]
+        findings.append({"sev": sev, "file": f, "line": int(line), "reason": reason.strip()})
+    if findings:
+        lgtm = False
+    return findings, lgtm, dropped
+
+
+def fmt_finding(f):
+    return f"{f['sev']}|{f['file']}:{f['line']}|{f['reason']}"
+
+
+def annotate_diff(diff):
+    """diff 각 줄 앞에 새 파일 기준 줄 번호를 붙인다(삭제 줄은 공란)."""
+    out, new_ln = [], None
+    for line in diff.splitlines():
+        if line.startswith("diff --git"):
+            new_ln = None  # 파일 헤더 구간: 첫 @@ 전까지는 번호 없음
+        m = re.match(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+        if m:
+            new_ln = int(m.group(1))
+            out.append(f"{'':>6} {line}")
+        elif new_ln is None or line.startswith(("-", "\\")):
+            out.append(f"{'':>6} {line}")
+        else:
+            out.append(f"{new_ln:>6} {line}")
+            new_ln += 1
+    return "\n".join(out)
+
+
+def collect_diff(args, top):
+    sources = sum(bool(x) for x in (args.base, args.uncommitted, args.diff_file))
+    if sources > 1:
+        raise UsageError("--base / --uncommitted / --diff-file 중 하나만")
+    if args.diff_file:
+        if args.diff_file == "-":
+            d = readable_stdin()
+            if d is None:
+                raise UsageError("--diff-file - 인데 stdin이 파이프/파일이 아님")
+        else:
+            d = Path(args.diff_file).read_text()
+        return d, f"diff file {args.diff_file}"
+    if args.uncommitted:
+        d = git("diff", "HEAD", cwd=top)
+        for f in git("ls-files", "--others", "--exclude-standard", "-z", cwd=top).split("\0"):
+            if f:
+                r = subprocess.run(["git", "diff", "--no-index", "--", "/dev/null", f], cwd=top,
+                                   capture_output=True, text=True, stdin=subprocess.DEVNULL)
+                d += r.stdout
+        return d, "uncommitted changes (git diff HEAD + untracked)"
+    base = args.base or "main"
+    return git("diff", f"{base}...HEAD", cwd=top), f"git diff {base}...HEAD"
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_list(presets):
+    for name, p in presets.items():
+        wt = " worktree" if p.get("worktree") else ""
+        print(f"{name:<16} {p['mode']:<6} {p['model']:<28} {p['agent']}/{p['permissions']}{wt} "
+              f"timeout={p['timeout_sec']}s  {p.get('description', '')}")
+    return 0
+
+
+def exit_code(results, any_high):
+    failed = sum(r["status"] != "ok" for r in results)
+    if failed == len(results):
+        return 4
+    if failed:
+        return 3
+    return 1 if any_high else 0
+
+
+def cmd_review(args, presets, agents):
+    top = git_toplevel()
+    if not top:
+        raise UsageError("git repo 안에서 실행해야 함")
+    names = args.presets
+    for n in names:
+        if get_preset(presets, n)["mode"] != "review":
+            raise UsageError(f"'{n}'는 review 프리셋이 아님")
+    if len(set(names)) != len(names):
+        raise UsageError("프리셋 중복")
+    diff, source = collect_diff(args, top)
+    if not diff.strip():
+        raise UsageError(f"리뷰할 diff가 비어 있음 ({source})")
+    prompt = (f"{REVIEW_CONTRACT}\nDiff source: {source}\n"
+              f"Left column = line number in the new file.\n\n{annotate_diff(diff)}\n")
+
+    ts = timestamp()
+    print(f"xagent review: {source}, {len(diff.splitlines())} diff lines, presets={','.join(names)}",
+          file=sys.stderr)
+    with ThreadPoolExecutor(max_workers=len(names)) as ex:
+        results = list(ex.map(lambda n: run_opencode(n, presets[n], agents, prompt, top, ts), names))
+
+    any_high = False
+    by_key = {}
+    for r in results:
+        r["findings"], r["lgtm"], r["dropped"] = parse_review(r["texts"]) if r["status"] == "ok" else ([], False, [])
+        if r["status"] == "ok" and not r["findings"] and not r["lgtm"]:
+            r["status"] = "no-contract-output"
+        summary = "\n".join(fmt_finding(f) for f in r["findings"]) or ("LGTM" if r["lgtm"] else "")
+        write_log(r, f"kept={len(r['findings']) + r['lgtm']} dropped={len(r['dropped'])}\n{summary}\n"
+                     + "".join(f"DROPPED: {d}\n" for d in r["dropped"]) + "\n".join(r["errors"]))
+        if r["status"] == "ok":
+            any_high |= any(f["sev"] == "high" for f in r["findings"])
+            seen = set()
+            for f in r["findings"]:
+                key = (f["file"], f["line"])
+                if key not in seen:
+                    seen.add(key)
+                    by_key.setdefault(key, []).append((r["preset"], f))
+
+    common = {k: v for k, v in by_key.items() if len(v) >= 2}
+    print("### 공통 지적 (2+ 프리셋, file:line 일치)")
+    if common:
+        for (f, ln), hits in sorted(common.items(), key=lambda kv: (-max(SEVERITY_RANK[h[1]["sev"]] for h in kv[1]),
+                                                                     kv[0])):
+            top_hit = max(hits, key=lambda h: SEVERITY_RANK[h[1]["sev"]])[1]
+            print(f"{fmt_finding(top_hit)}  [{', '.join(h[0] for h in hits)}]")
+    else:
+        print("(없음)")
+    for r in results:
+        head = f"### {r['preset']}  {r['status']}"
+        if r["status"] == "timeout":
+            head += f"({presets[r['preset']]['timeout_sec']}s)"
+        head += f"  {r['elapsed']:.1f}s"
+        if r["status"] in ("ok", "no-contract-output"):
+            head += f"  kept={len(r['findings']) + r['lgtm']} dropped={len(r['dropped'])}"
+        print(f"\n{head}  log={r['log']}")
+        if r["status"] == "ok":
+            for f in sorted(r["findings"], key=lambda f: (-SEVERITY_RANK[f["sev"]], f["file"], f["line"])):
+                print(fmt_finding(f))
+            if r["lgtm"]:
+                print("LGTM")
+        elif r["errors"]:
+            print(f"(실패) {r['errors'][0][:300]}")
+    return exit_code(results, any_high)
+
+
+def cmd_single(name, prompt_arg, presets, agents):
+    preset = get_preset(presets, name)
+    stdin_text = readable_stdin()
+    if prompt_arg and stdin_text:
+        prompt = f"{prompt_arg}\n\n<stdin>\n{stdin_text}\n</stdin>\n"
+    else:
+        prompt = prompt_arg or stdin_text
+    if not prompt or not prompt.strip():
+        raise UsageError("프롬프트가 없음 (인자 또는 파이프/파일 stdin)")
+
+    top = git_toplevel()
+    cwd = os.getcwd()
+    ts = timestamp()
+    wt = branch = None
+    if preset["mode"] == "review":
+        prompt = f"{REVIEW_CONTRACT}\n{prompt}"
+        cwd = top or cwd
+    elif preset.get("worktree"):
+        if not top:
+            raise UsageError("worktree 프리셋은 git repo 안에서 실행해야 함")
+        wt = str(Path(top).parent / f"wt-xagent-{name}-{ts}")
+        branch = f"xagent/{name}-{ts}"
+        git("worktree", "add", wt, "-b", branch, cwd=top)
+        cwd = wt
+
+    r = run_opencode(name, preset, agents, prompt, cwd, ts)
+    if preset["mode"] == "review":
+        if r["status"] == "ok":
+            r["findings"], r["lgtm"], r["dropped"] = parse_review(r["texts"])
+            if not r["findings"] and not r["lgtm"]:
+                r["status"] = "no-contract-output"
+        else:
+            r["findings"], r["lgtm"], r["dropped"] = [], False, []
+        body = "\n".join(fmt_finding(f) for f in r["findings"]) or ("LGTM" if r["lgtm"] else "")
+        write_log(r, f"kept={len(r['findings']) + r['lgtm']} dropped={len(r['dropped'])}\n{body}\n"
+                     + "".join(f"DROPPED: {d}\n" for d in r["dropped"]) + "\n".join(r["errors"]))
+        print(f"### {name}  {r['status']}  {r['elapsed']:.1f}s  kept={len(r['findings']) + r['lgtm']} "
+              f"dropped={len(r['dropped'])}  log={r['log']}", file=sys.stderr)
+        if body:
+            print(body)
+        return exit_code([r], any(f["sev"] == "high" for f in r["findings"]))
+
+    final = next((t for t in reversed(r["texts"]) if t.strip()), "")
+    write_log(r, final + ("\n" + "\n".join(r["errors"]) if r["errors"] else ""))
+    print(f"### {name}  {r['status']}  {r['elapsed']:.1f}s  log={r['log']}", file=sys.stderr)
+    if final:
+        print(final)
+    elif r["errors"]:
+        print(f"(실패) {r['errors'][0][:300]}", file=sys.stderr)
+    if wt:
+        subprocess.run(["git", "add", "-A", "-N"], cwd=wt, capture_output=True, stdin=subprocess.DEVNULL)
+        stat_out = git("diff", "--stat", cwd=wt, check=False).strip()
+        print(f"\n### worktree  {wt}\nbranch: {branch}  (merge하지 않음)")
+        print(stat_out or "(변경 없음)")
+        print(f"정리: git worktree remove --force {wt} && git branch -D {branch}")
+    return exit_code([r], False)
+
+
+def main():
+    if os.environ.get("XAGENT_DEPTH"):
+        print("xagent: 재귀 호출 거부 (XAGENT_DEPTH 설정됨)", file=sys.stderr)
+        return 2
+    argv = sys.argv[1:]
+    try:
+        presets, agents = load_presets()
+        if not argv or argv[0] in ("-h", "--help"):
+            print(__doc__.strip() + "\n\n  xagent list\n  xagent <preset> [\"<prompt>\"]\n"
+                  "  xagent review [--base REF | --uncommitted | --diff-file PATH|-] <preset>...")
+            return 0 if argv else 2
+        if argv[0] == "list":
+            return cmd_list(presets)
+        if argv[0] == "review":
+            ap = argparse.ArgumentParser(prog="xagent review")
+            ap.add_argument("--base")
+            ap.add_argument("--uncommitted", action="store_true")
+            ap.add_argument("--diff-file")
+            ap.add_argument("presets", nargs="+")
+            args = ap.parse_args(argv[1:])
+            return cmd_review(args, presets, agents)
+        if len(argv) > 2:
+            raise UsageError('사용법: xagent <preset> ["<prompt>"] — 프롬프트는 따옴표로 한 인자')
+        return cmd_single(argv[0], argv[1] if len(argv) > 1 else None, presets, agents)
+    except UsageError as e:
+        print(f"xagent: {e}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
