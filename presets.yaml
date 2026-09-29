@@ -92,4 +92,4 @@ presets:
     mode: task
     permissions: workspace-write
     worktree: true
-    timeout_sec: 600
+    timeout_sec: 540   # Bash 도구 상한 600s보다 짧게: xagent 자체 타임아웃이 먼저 걸려야 정리·기록된다

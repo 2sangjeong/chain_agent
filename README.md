@@ -78,13 +78,13 @@ xagent stats                                       # task 수락률·토큰·소
   - 6시간 넘은 `$TMPDIR/xagent-db-*` 임시 DB(SIGKILL 잔여물)도 지운다.
 - `stats`:
   - 프리셋별 실행 수, status, 결과 분포, 토큰 합, 소요 중앙값을 보여준다.
-  - **수락률** = (accepted+modified) / (accepted+modified+discarded+empty).
+  - **수락률** = (accepted+modified) / (accepted+modified+discarded+empty). 중단(`killed`)과 미결(pending)은 위임 품질과 무관하므로 제외한다.
 
 `tasks.jsonl` 형식(한 줄 한 이벤트):
 
 ```
 {"event":"run", "id", "at", "preset", "model", "repo", "worktree", "branch", "base", "status", "elapsed", "tokens":{input,output,reasoning,cache_read,cache_write}, "files_changed"}
-{"event":"outcome", "id", "at", "outcome": "accepted|modified|discarded|empty", "note"}
+{"event":"outcome", "id", "at", "outcome": "accepted|modified|discarded|empty|killed", "note"}
 ```
 
 ### 격리
@@ -138,7 +138,7 @@ env(허용 목록 + 아래 고정값만): PWD=<cwd>  OPENCODE_DB=<실행별 임�
 
 우선순위: 2 > 4 > 3 > 1 > 0. `apply|discard|gc|stats`는 0 성공 / 2 오류.
 
-**시그널로 중단되면** 실행 중인 러너 프로세스 그룹을 종료하고 임시 DB를 지운다. task는 `status=killed`로 기록하고, 변경이 없는 worktree는 지운다(`empty`). 이후 종료 코드는 143이다. `claude -p`처럼 세션이 끝나면 백그라운드 xagent가 SIGTERM으로 죽는다(실측). SIGKILL이면 이 처리가 돌지 못하므로 `gc`가 뒷정리한다.
+**시그널로 중단되면** 실행 중인 러너 프로세스 그룹을 종료하고 임시 DB를 지운다. task는 `status=killed`로 기록하고, 변경이 없는 worktree는 지운다(outcome `killed`). 이후 종료 코드는 143이다. `claude -p`처럼 세션이 끝나면 백그라운드 xagent가 SIGTERM으로 죽는다(실측). SIGKILL이면 이 처리가 돌지 못하므로 `gc`가 뒷정리한다.
  타임아웃은 해당 프리셋만 실패시키고 나머지는 끝까지 기다린다. `timeout_sec`는 러너 프로세스에만 적용된다(worktree 생성 제외).
 
 ### 로그
