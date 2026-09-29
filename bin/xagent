@@ -590,10 +590,25 @@ def find_worktree(arg, top):
     raise UsageError(f"xagent worktree를 찾을 수 없음: {arg} (xagent gc로 목록 확인)")
 
 
-def worktree_changes(wt):
-    """미추적 파일을 intent-to-add로 올린 뒤(worktree 인덱스만) 변경 파일 목록."""
-    subprocess.run(["git", "add", "-A", "-N"], cwd=wt, capture_output=True, stdin=subprocess.DEVNULL)
-    return [f for f in git("diff", "--name-only", cwd=wt, check=False).splitlines() if f]
+WORKER_COMMIT_MSG = "xagent: worker changes"
+
+
+def freeze_worker_changes(wt):
+    """worker가 남긴 변경을 커밋으로 고정하고 변경 파일 목록을 돌려준다.
+    고정해 두지 않으면 호출자가 worktree에서 테스트를 돌리며 만든 산출물(__pycache__ 등)까지
+    apply에 딸려 들어간다(실측)."""
+    if git("status", "--porcelain", "--untracked-files=all", cwd=wt, check=False).strip():
+        git("add", "-A", cwd=wt)
+        git("-c", "user.name=xagent", "-c", "user.email=xagent@localhost", "commit", "-q", "--no-verify",
+            "-m", WORKER_COMMIT_MSG, cwd=wt)
+    return worker_files(wt)
+
+
+def worker_files(wt):
+    """고정된 worker 커밋의 변경 파일 목록(커밋이 없으면 빈 목록)."""
+    if git("log", "-1", "--format=%s", cwd=wt, check=False).strip() != WORKER_COMMIT_MSG:
+        return []
+    return [f for f in git("diff", "--name-only", "HEAD~1", "HEAD", cwd=wt).splitlines() if f]
 
 
 def remove_worktree(top, wt, branch):
@@ -650,7 +665,7 @@ def cmd_single(name, prompt_arg, presets, agents):
     try:
         r = run_opencode(name, preset, agents, TASK_PREAMBLE + prompt, cwd, ts)
     except Interrupted as e:
-        changed = worktree_changes(wt) if wt else []
+        changed = freeze_worker_changes(wt) if wt else []
         record("run", id=tid or f"{name}-{ts}", preset=name, model=preset["model"], repo=top, worktree=wt,
                branch=branch, base=base, snapshot_files=snap_files, status="killed", signal=str(e),
                elapsed=None, tokens=None, files_changed=len(changed))
@@ -672,7 +687,7 @@ def cmd_single(name, prompt_arg, presets, agents):
     elif r["errors"]:
         print(f"(실패) {r['errors'][0][:300]}", file=sys.stderr)
 
-    changed = worktree_changes(wt) if wt else []
+    changed = freeze_worker_changes(wt) if wt else []
     record("run", id=tid or f"{name}-{ts}", preset=name, model=preset["model"], repo=top, worktree=wt,
            branch=branch, base=base, snapshot_files=snap_files, status=r["status"],
            elapsed=round(r["elapsed"], 1), tokens=r["tokens"], files_changed=len(changed))
@@ -683,13 +698,14 @@ def cmd_single(name, prompt_arg, presets, agents):
             record("outcome", id=tid, outcome="empty", note=f"status={r['status']}")
             print(f"\n### worktree  (변경 없음 → 자동 삭제)  id={tid}")
         else:
-            stat_lines = git("diff", "--stat", cwd=wt, check=False).rstrip().splitlines()
+            stat_lines = git("diff", "--stat", "HEAD~1", "HEAD", cwd=wt, check=False).rstrip().splitlines()
             if len(stat_lines) > STAT_MAX_LINES:
                 stat_lines = stat_lines[:STAT_MAX_LINES - 1] + [f"… ({len(stat_lines) - STAT_MAX_LINES + 1}줄 생략)",
                                                                 stat_lines[-1]]
             print(f"\n### worktree  id={tid}\npath: {wt}{snap}")
             print("\n".join(stat_lines))
-            print(f"검토: git -C {wt} diff\n가져오기: xagent apply {tid} [--modified]   버리기: xagent discard {tid}")
+            print(f"검토: git -C {wt} diff HEAD~1   (worker 변경은 커밋으로 고정됨, 이후 worktree 변경은 apply에 안 들어감)\n"
+                  f"가져오기: xagent apply {tid} [--modified]   버리기: xagent discard {tid}")
     return exit_code([r], False)
 
 
@@ -716,9 +732,9 @@ def _single_review(name, preset, agents, prompt, cwd, ts):
 def cmd_apply(args):
     top = main_toplevel()
     wt, branch, tid = find_worktree(args.target, top)
-    if not worktree_changes(wt):
-        raise UsageError(f"적용할 변경이 없음: {tid} (xagent discard {tid})")
-    patch = git("diff", "--binary", cwd=wt)
+    if not worker_files(wt):
+        raise UsageError(f"적용할 worker 변경 커밋이 없음: {tid} (xagent discard {tid})")
+    patch = git("diff", "--binary", "HEAD~1", "HEAD", cwd=wt)
     for extra in (["--check"], []):
         r = subprocess.run(["git", "apply", *extra], input=patch, cwd=top, capture_output=True, text=True)
         if r.returncode != 0:
@@ -760,7 +776,8 @@ def cmd_gc(args):
     ran = {e["id"] for e in events if e.get("event") == "run"}
     kept = []
     for wt, branch, tid in xagent_worktrees(top):
-        changed = worktree_changes(wt)
+        # 고정된 worker 커밋, 또는 (SIGKILL 등으로) 고정 못 한 채 남은 변경
+        changed = worker_files(wt) or [ln for ln in git("status", "--porcelain", cwd=wt, check=False).splitlines() if ln]
         if changed and not args.all:
             kept.append((tid, wt, len(changed)))
             continue

@@ -66,8 +66,8 @@ xagent <task 프리셋> "<대상 파일, 기대 결과, 하지 말 것, 검증 �
 
 ### 끝나면 (매번 이 순서)
 1. 출력의 `id`와 `path`를 확인한다. 변경이 없으면 worktree는 이미 자동 삭제됐다.
-2. **diff를 직접 검토**: `git -C <path> diff`, 새 파일은 Read.
-3. **테스트를 직접 돌린다**: worktree 안에서(예: `cd <path> && python3 run_tests.py`).
+2. **diff를 직접 검토**: `git -C <path> diff HEAD~1`(worker 변경은 커밋으로 고정됨), 새 파일은 Read.
+3. **테스트를 직접 돌린다**: worktree 안에서(예: `cd <path> && python3 run_tests.py`). 여기서 생긴 파일은 apply에 들어가지 않는다.
 4. 판정해서 기록한다. 수락률 측정에 쓰이므로 정직하게 고른다.
    - 그대로 좋음: `xagent apply <id>`
    - 가져온 뒤 내가 고칠 것: `xagent apply <id> --modified --note "<무엇을>"`
