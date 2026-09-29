@@ -656,7 +656,7 @@ def cmd_single(name, prompt_arg, presets, agents):
                elapsed=None, tokens=None, files_changed=len(changed))
         if wt and not changed:
             remove_worktree(top, wt, branch)
-            record("outcome", id=tid, outcome="empty", note=f"killed by {e}")
+            record("outcome", id=tid, outcome="killed", note=f"{e}")
         elif wt:
             print(f"xagent: 중단됨 — 변경 있는 worktree는 남김: {tid}", file=sys.stderr)
         raise
@@ -755,7 +755,9 @@ def cmd_gc(args):
                 print(f"오래된 임시 DB 삭제: {d}")
         except OSError:
             pass
-    decided = {e["id"] for e in read_records() if e.get("event") == "outcome"}
+    events = read_records()
+    decided = {e["id"] for e in events if e.get("event") == "outcome"}
+    ran = {e["id"] for e in events if e.get("event") == "run"}
     kept = []
     for wt, branch, tid in xagent_worktrees(top):
         changed = worktree_changes(wt)
@@ -763,7 +765,9 @@ def cmd_gc(args):
             kept.append((tid, wt, len(changed)))
             continue
         if tid not in decided:
-            record("outcome", id=tid, outcome="discarded" if changed else "empty", note="gc")
+            # 실행 기록조차 없으면 도중에 죽은 것(SIGKILL 등) — 수락률 분모에서 빠지도록 killed
+            outcome = "killed" if tid not in ran else ("discarded" if changed else "empty")
+            record("outcome", id=tid, outcome=outcome, note="gc")
         remove_worktree(top, wt, branch)
         print(f"삭제: {tid}  ({'변경 ' + str(len(changed)) + '개 파일 폐기' if changed else '변경 없음'})")
     live = {b for _, b, _ in xagent_worktrees(top)}
@@ -803,6 +807,7 @@ def cmd_stats():
     acc = sum(o in ACCEPT_ACCEPTED for o in decided)
     rate = acc / len(decided) if decided else 0.0
     print(f"\n수락률 = (accepted+modified)/(accepted+modified+discarded+empty) = {acc}/{len(decided)}"
+          f"  (killed·pending 제외)"
           f" = {rate:.0%}")
     if len(decided) >= 20 and rate >= 0.7:
         print("자동 위임 전환 기준 충족 (결정 20건 이상, 수락률 70% 이상) — 사용자에게 전환 여부를 물을 것")
