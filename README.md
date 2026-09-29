@@ -9,6 +9,7 @@ Claude Code에서 외부 코딩 에이전트를 서브에이전트로 호출하�
 | `~/bin/xagent` | → `~/xagent/bin/xagent` |
 | `~/.claude/skills/xagent/` | → `~/xagent/skill/` |
 | `~/.xagent/logs/` | 실행 로그 (repo 밖) |
+| `~/.xagent/tasks.jsonl` | task 실행·결과 기록 (`xagent stats`의 원천) |
 
 ## CLI
 
@@ -16,7 +17,14 @@ Claude Code에서 외부 코딩 에이전트를 서브에이전트로 호출하�
 xagent list                                        # 프리셋 목록 (YAML에서 읽음)
 xagent <preset> ["<prompt>"]                       # 단일 실행
 xagent review [--base REF | --uncommitted | --diff-file PATH|-] <preset> [<preset>...]
+xagent apply <id|worktree경로> [--modified] [--note TEXT]   # worktree 변경을 메인 트리에 적용 + 기록 + 정리
+xagent discard <id|worktree경로> [--note TEXT]              # 버림 + 기록 + 정리
+xagent gc [--all]                                  # 현재 repo의 xagent worktree 정리
+xagent stats                                       # task 수락률·토큰·소요시간 집계
 ```
+
+`<id>`는 `<preset>-<YYYYmmdd-HHMMSS>-<rand4>`. worktree는 `../wt-xagent-<id>`, 브랜치는 `xagent/<id>`.
+`apply|discard|gc`는 대상 repo(메인 작업 트리) 안에서 실행한다.
 
 ### 입력
 
@@ -34,8 +42,8 @@ xagent review [--base REF | --uncommitted | --diff-file PATH|-] <preset> [<prese
 ### review 모드
 
 - 대상은 `mode: review` 프리셋만. 여러 개면 **병렬** 실행.
-- 읽기 전용 강제: 프리셋이 무엇을 적었든 실행 시 reviewer agent에 `edit/bash/webfetch/task/external_directory: deny`를 덮어써 주입한다. `permissions`가 `read-only`가 아니면 설정 오류.
-- 작업 디렉터리는 git toplevel. reviewer는 read/grep/glob으로 주변 코드를 읽을 수 있다.
+- 읽기 전용 강제: `permissions: read-only` 프리셋은 모드와 무관하게 실행 시 `edit/bash/webfetch/task/external_directory: deny`를 덮어써 주입한다. review 모드에서 `permissions`가 `read-only`가 아니면 설정 오류.
+- 작업 디렉터리는 git toplevel. reviewer는 read/grep/glob으로 주변 코드를 읽을 수 있다(비밀 파일 제외, 아래 "격리").
 - 리뷰 출력 계약(아래)을 프롬프트에 자동 삽입한다. diff 줄 앞에는 **새 파일(HEAD 쪽) 줄 번호**를 붙여 넘긴다.
 - 계약 형식이 아닌 줄은 걸러낸다. 원문은 로그에만 남긴다. 걸러진 줄 수는 결과 헤더에 `dropped=N`으로 표시한다.
 - 출력 순서:
@@ -44,18 +52,56 @@ xagent review [--base REF | --uncommitted | --diff-file PATH|-] <preset> [<prese
 
 ### task 모드
 
-- `worktree: true`면 git toplevel에서 `git worktree add ../wt-xagent-<preset>-<ts> -b xagent/<preset>-<ts>`(HEAD 기준)를 만들고, 그 안에서 실행한다.
-  - 메인 작업 트리의 미커밋 변경은 넘어가지 않는다.
-  - 종료 후 worktree 안에서 `git add -N`(미추적 파일을 intent-to-add, worktree 인덱스만)을 한 뒤 `git diff --stat`, worktree 경로, 브랜치, 정리 명령을 출력한다.
-  - **merge·삭제는 하지 않는다.**
+- `worktree: true`면 git toplevel에서 `git worktree add ../wt-xagent-<id> -b xagent/<id>`(HEAD 기준)를 만들고, 그 안에서 실행한다.
+  - `<id>`에 4자리 난수를 붙여 같은 초에 병렬로 띄워도 충돌하지 않는다.
+  - **base 스냅샷**: 메인 트리에 커밋 안 된 **tracked** 변경(`git diff HEAD`)이 있으면 worktree에 적용해 `xagent: base snapshot` 커밋으로 만든다. worker는 현재 상태를 보고 작업하고, 이후 diff에는 worker 변경만 남는다. 미추적 파일은 넘어가지 않는다.
+  - 종료 후 worktree 안에서 `git add -N`(worktree 인덱스만)을 한 뒤 `git diff --stat`(최대 40줄), id, worktree 경로를 출력한다.
+  - **변경이 없으면 worktree와 브랜치를 자동 삭제**하고 결과를 `empty`로 기록한다. 변경이 있으면 남겨 둔다.
+  - **merge는 하지 않는다.** 가져오기는 `xagent apply`, 버리기는 `xagent discard`.
+- worker는 셸이 없다. 테스트 실행은 호출자가 worktree에서 한다. xagent는 이 사실을 task 프롬프트 앞에 붙인다.
 - `worktree: false`면 현재 디렉터리에서 실행한다(메인 트리가 바뀔 수 있음).
-- stdout에는 에이전트의 마지막 텍스트 응답을 출력한다.
+- stdout에는 에이전트의 마지막 텍스트 응답을 출력하되 **뒤쪽 4000자까지만**. 넘으면 생략 표시를 하고 전문은 로그에 둔다.
+
+### apply / discard / gc / stats
+
+- `apply`:
+  1. worktree 변경(`git diff --binary`, base 스냅샷 이후분)을 메인 toplevel에 `git apply`한다(`--check` 선행).
+  2. 성공하면 결과를 `accepted`(`--modified`면 `modified`)로 기록하고 worktree와 브랜치를 지운다.
+  3. 적용이 실패하면 아무것도 지우지 않고 종료 코드 2.
+- `discard`: `discarded`로 기록하고 지운다.
+- `gc`:
+  - 변경 없는 xagent worktree를 지운다.
+  - `--all`이면 변경 있는 것도 지우고, 결과가 없던 건 `discarded`(note=gc)로 기록한다.
+  - worktree 없는 `xagent/*` 브랜치도 지운다.
+- `stats`:
+  - 프리셋별 실행 수, status, 결과 분포, 토큰 합, 소요 중앙값을 보여준다.
+  - **수락률** = (accepted+modified) / (accepted+modified+discarded+empty).
+
+`tasks.jsonl` 형식(한 줄 한 이벤트):
+
+```
+{"event":"run", "id", "at", "preset", "model", "repo", "worktree", "branch", "base", "status", "elapsed", "tokens":{input,output,reasoning,cache_read,cache_write}, "files_changed"}
+{"event":"outcome", "id", "at", "outcome": "accepted|modified|discarded|empty", "note"}
+```
+
+### 격리
+
+- **비밀 파일**: `presets.yaml`의 `secret_patterns`를 모든 agent의 `read` 권한에 deny로 강제한다(`secret_allow`는 예외 허용).
+  - grep 도구는 read 규칙을 따르지 않지만 `.gitignore`된 파일은 건너뛴다(실측).
+  - 그래서 실행 전 `git ls-files -co --exclude-standard`에 비밀 패턴 파일이 보이면 **그 실행에서 grep을 deny**하고 stderr와 로그에 알린다.
+  - git repo가 아닌 곳에서도 grep을 deny한다.
+- **하위 에이전트 금지**: 모든 agent에 `task: deny`, `webfetch: deny`, `external_directory: deny`를 강제한다. `task`가 열리면 모델이 제한을 물려받지 않는 하위 에이전트를 띄워 `.env`·DB를 읽었다(실측).
+- **worker 셸 금지**: `bash: deny`.
+- **환경변수 허용 목록**: 러너에는 다음만 넘긴다.
+  - `PATH HOME USER LOGNAME LANG LC_* TMPDIR XDG_*_HOME XDG_RUNTIME_DIR` 및 프록시 변수
+  - xagent 고정값
+  - 나머지(API 키 등)는 넘기지 않는다.
 
 ### 러너 호출 (opencode, 실측 근거)
 
 ```
 opencode run --pure --format json --dir <cwd> --agent <agent> -m <model>   < prompt
-env: PWD=<cwd>  OPENCODE_DB=<실행별 임시 DB>  OPENCODE_CONFIG_CONTENT=<agent 정의 JSON>  OPENCODE_DISABLE_PROJECT_CONFIG=1
+env(허용 목록 + 아래 고정값만): PWD=<cwd>  OPENCODE_DB=<실행별 임시 DB>  OPENCODE_CONFIG_CONTENT=<agent 정의 JSON>  OPENCODE_DISABLE_PROJECT_CONFIG=1
      OPENCODE_DISABLE_CLAUDE_CODE_SKILLS=1  OPENCODE_DISABLE_AUTOUPDATE=1  XAGENT_DEPTH=1
 ```
 
@@ -86,7 +132,7 @@ env: PWD=<cwd>  OPENCODE_DB=<실행별 임시 DB>  OPENCODE_CONFIG_CONTENT=<agen
 | 3 | 일부 프리셋 실패 |
 | 4 | 모든 프리셋 실패 |
 
-우선순위: 2 > 4 > 3 > 1 > 0. 타임아웃은 해당 프리셋만 실패시키고 나머지는 끝까지 기다린다. `timeout_sec`는 러너 프로세스에만 적용된다(worktree 생성 제외).
+우선순위: 2 > 4 > 3 > 1 > 0. `apply|discard|gc|stats`는 0 성공 / 2 오류. 타임아웃은 해당 프리셋만 실패시키고 나머지는 끝까지 기다린다. `timeout_sec`는 러너 프로세스에만 적용된다(worktree 생성 제외).
 
 ### 로그
 
@@ -98,7 +144,11 @@ env: PWD=<cwd>  OPENCODE_DB=<실행별 임시 DB>  OPENCODE_CONFIG_CONTENT=<agen
 - 전체 프롬프트
 - 러너 stdout(JSON 이벤트) 원문과 stderr
 - status, 소요 시간
+- 토큰 사용량(`step_finish` 이벤트 합)
+- grep 차단 여부와 사유
 - 계약 필터 결과(kept/dropped)
+
+결과 헤더에도 `tok=<input>/<output>`을 표시한다.
 
 ## 리뷰 출력 계약
 

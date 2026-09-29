@@ -21,23 +21,33 @@ opencode:
         external_directory: deny
     worker:
       mode: primary
-      description: xagent worker (edits allowed inside its directory; bash allow-list only)
+      description: xagent worker (edits inside its worktree only; no shell, no network, no subagents)
       permission:
         edit: allow
+        # bash 전면 금지(2026-09-29 Opus 검토): pytest 등은 사용자 권한 임의 코드 실행이고
+        # external_directory는 셸이 실행한 코드를 막지 못한다. 테스트는 호출자(Claude)가 worktree에서 돌린다.
+        bash: deny
         webfetch: deny
         task: deny
         external_directory: deny
-        # bash는 허용 목록만. "*" 허용 금지, xagent 재귀 호출 가능한 명령 금지.
-        # 주의: pytest 등은 임의 코드를 실행한다. worktree 격리는 git 격리이지 보안 격리가 아니다.
-        bash:
-          "*": deny
-          "git status*": allow
-          "git diff*": allow
-          "git log*": allow
-          "git show*": allow
-          "ls*": allow
-          "pytest*": allow
-          "python3 -m pytest*": allow
+
+# 비밀 파일 패턴. xagent가 모든 agent의 read 권한에 deny로 강제 주입한다.
+# grep 도구는 read 규칙을 따르지 않지만 .gitignore된 파일은 건너뛴다(실측).
+# 그래서 실행 전 git에서 "gitignore되지 않은" 이 패턴 파일이 보이면 그 실행에서 grep도 deny한다.
+secret_patterns:
+  - "*.env"
+  - "*.env.*"
+  - "*.db"
+  - "*.db-*"
+  - "*.sqlite"
+  - "*.sqlite3"
+  - "*.pem"
+  - "*.key"
+  - "*id_rsa*"
+  - "*id_ed25519*"
+# 위 패턴에 걸려도 읽기를 허용할 예외
+secret_allow:
+  - "*.env.example"
 
 # 프리셋 필드
 #   runner       opencode            (codex|kiro는 스키마 예약, 현재 미지원 -> 설정 오류)
@@ -47,7 +57,7 @@ opencode:
 #   permissions  read-only | workspace-write
 #                agent 권한과의 일치를 xagent가 검증하는 라벨.
 #                read-only: agent의 edit·bash가 deny여야 함. review 모드는 read-only만 허용.
-#   worktree     bool. task 모드에서 true면 ../wt-xagent-<preset>-<ts> worktree에서 실행
+#   worktree     bool. task 모드에서 true면 ../wt-xagent-<id> worktree에서 실행 (id = <preset>-<ts>-<rand4>)
 #   timeout_sec  runner 프로세스 벽시계 상한(초). 초과 시 해당 프리셋만 실패
 #   description  (선택) 목록 표시용
 #
