@@ -1,6 +1,6 @@
 ---
 name: xagent
-description: Runs other model families (via opencode on local vLLM) as sub-agents through the `xagent` CLI, for cross-review and light delegated tasks. Use when the user asks for a cross-review, second opinion, or another model's review ("교차검토", "교차 검토", "크로스 리뷰", "세컨드 오피니언", "다른 모델한테 리뷰", "second opinion", "cross-review"), and before committing SQL, schema, permission, or infrastructure changes. Also use when the user explicitly asks to delegate a task to xagent / opencode / a cheaper model. Do not use it otherwise.
+description: Runs other model families (via opencode on private-network vLLM) as sub-agents through the `xagent` CLI, for cross-review and light delegated tasks. Use when the user asks for a cross-review, second opinion, or another model's review ("교차검토", "교차 검토", "크로스 리뷰", "세컨드 오피니언", "다른 모델한테 리뷰", "second opinion", "cross-review"), and before committing SQL, schema, permission, or infrastructure changes. Also use when the user explicitly asks to delegate a task to xagent / opencode / a cheaper model. Do not use it otherwise.
 ---
 
 # xagent — 외부 에이전트 교차검토·위임
@@ -54,4 +54,4 @@ xagent <task 프리셋> "<구체적 지시: 대상 파일, 기대 결과, 검증
 ## 주의
 
 - xagent 안에서 xagent를 부르지 않는다(`XAGENT_DEPTH` 가드로 거부된다).
-- 프리셋은 로컬 vLLM만 쓴다. 외부 모델 프리셋을 추가하는 건 사용자 결정이다.
+- 프리셋은 사설망 GPU 팜 vLLM만 쓴다(opencode.ai 경유 외부 무료 모델 제외). 외부 모델 프리셋을 추가하는 건 사용자 결정이다.
