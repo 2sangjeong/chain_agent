@@ -1,16 +1,20 @@
 #!/usr/bin/python3
 """xagent — 외부 코딩 에이전트(opencode) 호출 래퍼. 계약은 ~/xagent/README.md."""
 import argparse
+import fnmatch
 import json
 import os
 import re
+import secrets
 import shutil
 import signal
 import stat
+import statistics
 import subprocess
 import sys
 import tempfile
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -19,9 +23,28 @@ import yaml
 
 PRESETS_PATH = Path(os.environ.get("XAGENT_PRESETS", "~/.config/xagent/presets.yaml")).expanduser()
 LOG_DIR = Path("~/.xagent/logs").expanduser()
+TASKS_PATH = Path(os.environ.get("XAGENT_TASKS", "~/.xagent/tasks.jsonl")).expanduser()
 KILL_GRACE_SEC = 5
+TASK_OUTPUT_MAX = 4000
+STAT_MAX_LINES = 40
 SEVERITY_RANK = {"high": 3, "med": 2, "low": 1}
 READ_ONLY_DENY = {k: "deny" for k in ("edit", "bash", "webfetch", "task", "external_directory")}
+# 모든 agent에 강제. task가 열리면 제한을 물려받지 않는 하위 에이전트가 .env·DB를 읽었다(실측).
+FORCED_DENY = {k: "deny" for k in ("task", "webfetch", "external_directory")}
+ENV_ALLOW = {"PATH", "HOME", "USER", "LOGNAME", "LANG", "TMPDIR", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME",
+             "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "http_proxy", "https_proxy", "no_proxy",
+             "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY"}
+SECRETS = {"deny": [], "allow": []}  # load_presets가 채운다
+WT_PREFIX = "wt-xagent-"
+ACCEPT_ACCEPTED = ("accepted", "modified")
+ACCEPT_DECIDED = ("accepted", "modified", "discarded", "empty")
+
+TASK_PREAMBLE = """\
+You are working inside an isolated git worktree (your current project directory). Edit files only there.
+You have no shell: do not try to run commands or tests. The caller will run the tests and review your diff.
+When done, reply with a short summary of what you changed.
+
+"""
 
 REVIEW_CONTRACT = """\
 You are a code reviewer. Review the diff below for real defects: bugs, off-by-one errors, \
@@ -53,6 +76,10 @@ def load_presets():
         raise UsageError(f"프리셋 파일을 읽을 수 없음: {PRESETS_PATH}: {e}")
     agents = (data.get("opencode") or {}).get("agents") or {}
     presets = data.get("presets") or {}
+    SECRETS["deny"] = list(data.get("secret_patterns") or [])
+    SECRETS["allow"] = list(data.get("secret_allow") or [])
+    if not SECRETS["deny"]:
+        raise UsageError("presets.yaml에 secret_patterns가 없음 (비밀 파일 차단은 필수)")
     for name, p in presets.items():
         validate_preset(name, p, agents)
     return presets, agents
@@ -120,41 +147,90 @@ def timestamp():
 
 
 def log_path(ts, preset):
+    # 병렬 실행이 같은 이름을 고르지 않도록 O_EXCL로 즉시 선점한다(존재 검사만 하면 둘 다 같은 경로를 고른다, 실측)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    path = LOG_DIR / f"{ts}-{preset}.log"
-    n = 1
-    while path.exists():
-        path = LOG_DIR / f"{ts}-{preset}.log.{n}"
-        n += 1
-    return path
+    path, n = LOG_DIR / f"{ts}-{preset}.log", 1
+    while True:
+        try:
+            with open(path, "x"):
+                return path
+        except FileExistsError:
+            path = LOG_DIR / f"{ts}-{preset}.log.{n}"
+            n += 1
 
 
 # ---------------------------------------------------------------- runner
 
-def build_agent_config(preset, agents):
+def is_secret(path):
+    base = os.path.basename(path)
+    hit = any(fnmatch.fnmatch(base, p) or fnmatch.fnmatch(path, p) for p in SECRETS["deny"])
+    ok = any(fnmatch.fnmatch(base, p) or fnmatch.fnmatch(path, p) for p in SECRETS["allow"])
+    return hit and not ok
+
+
+def secret_exposure(cwd):
+    """작업 트리에 비밀 패턴 파일이 있으면 사유 문자열, 없으면 None.
+    grep 도구는 read 규칙을 따르지 않는다. .gitignore는 존중하지만 모델이 include 글롭을 주면
+    ripgrep의 --glob가 ignore 규칙을 덮어써 gitignore된 .env도 읽힌다(실측). 그래서 ignore 여부와 무관하게 본다."""
+    hits = []
+    for root, dirs, files in os.walk(cwd):
+        dirs[:] = [d for d in dirs if d != ".git"]
+        hits += [os.path.relpath(os.path.join(root, f), cwd) for f in files if is_secret(f)]
+    if hits:
+        more = f" 외 {len(hits) - 3}개" if len(hits) > 3 else ""
+        return f"비밀 패턴 파일 존재: {', '.join(sorted(hits)[:3])}{more}"
+    return None
+
+
+def build_agent_config(preset, agents, grep_deny):
     agent = json.loads(json.dumps(agents[preset["agent"]]))  # deep copy
-    if preset["mode"] == "review":
-        # review는 프리셋 내용과 무관하게 읽기 전용을 덮어쓴다 (뒤 규칙이 이긴다)
-        agent["permission"] = {**(agent.get("permission") or {}), **READ_ONLY_DENY}
+    perm = dict(agent.get("permission") or {})
+    if preset["permissions"] == "read-only":
+        # 프리셋 내용과 무관하게 읽기 전용을 덮어쓴다 (뒤 규칙이 이긴다)
+        perm.update(READ_ONLY_DENY)
+    perm.update(FORCED_DENY)
+    read = perm.pop("read", None)
+    read_map = {"*": read} if isinstance(read, str) else dict(read or {})
+    read_map.setdefault("*", "allow")
+    # 순서가 곧 우선순위(뒤가 이김): 기존 키를 빼고 다시 넣어 비밀 deny → 예외 allow 순으로 끝에 둔다
+    for p in SECRETS["deny"]:
+        read_map.pop(p, None)
+        read_map[p] = "deny"
+    for p in SECRETS["allow"]:
+        read_map.pop(p, None)
+        read_map[p] = "allow"
+    perm["read"] = read_map
+    if grep_deny:
+        perm["grep"] = "deny"
+    agent["permission"] = perm
     return {"agent": {preset["agent"]: agent}}
 
 
-def run_opencode(name, preset, agents, prompt, cwd, ts):
-    """러너 1회 실행. 결과 dict 반환(status, texts, ...)."""
-    cfg = build_agent_config(preset, agents)
-    # opencode는 실제 cwd가 아니라 $PWD로 프로젝트 디렉터리를 정한다(실측). PWD와 --dir를 둘 다 맞추지 않으면
-    # worktree 실행이 호출한 셸의 메인 트리를 수정하고 external_directory deny도 그 기준으로 풀린다.
-    cmd = ["opencode", "run", "--pure", "--format", "json", "--dir", cwd,
-           "--agent", preset["agent"], "-m", preset["model"]]
-    env = {
-        **os.environ,
+def runner_env(cwd, cfg):
+    env = {k: v for k, v in os.environ.items() if k in ENV_ALLOW or k.startswith("LC_")}
+    env.update({
+        "TERM": "dumb",
         "PWD": cwd,
         "OPENCODE_CONFIG_CONTENT": json.dumps(cfg),
         "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
         "OPENCODE_DISABLE_CLAUDE_CODE_SKILLS": "1",
         "OPENCODE_DISABLE_AUTOUPDATE": "1",
         "XAGENT_DEPTH": "1",
-    }
+    })
+    return env
+
+
+def run_opencode(name, preset, agents, prompt, cwd, ts):
+    """러너 1회 실행. 결과 dict 반환(status, texts, tokens, ...)."""
+    grep_note = secret_exposure(cwd)
+    if grep_note:
+        print(f"xagent[{name}]: grep 차단 — {grep_note}", file=sys.stderr)
+    cfg = build_agent_config(preset, agents, grep_deny=bool(grep_note))
+    # opencode는 실제 cwd가 아니라 $PWD로 프로젝트 디렉터리를 정한다(실측). PWD와 --dir를 둘 다 맞추지 않으면
+    # worktree 실행이 호출한 셸의 메인 트리를 수정하고 external_directory deny도 그 기준으로 풀린다.
+    cmd = ["opencode", "run", "--pure", "--format", "json", "--dir", cwd,
+           "--agent", preset["agent"], "-m", preset["model"]]
+    env = runner_env(cwd, cfg)
     lp = log_path(ts, name)
     # 실행마다 별도 sqlite DB: 공유 opencode.db는 병렬 기동 시 "database is locked"로 간헐 실패했다(실측).
     dbdir = tempfile.mkdtemp(prefix="xagent-db-")
@@ -175,15 +251,23 @@ def run_opencode(name, preset, agents, prompt, cwd, ts):
     elapsed = time.monotonic() - start
 
     texts, errors = [], []
+    tokens = Counter()
     for line in (out or "").splitlines():
         try:
             ev = json.loads(line)
         except ValueError:
             continue
-        if ev.get("type") == "text" and (ev.get("part") or {}).get("text"):
-            texts.append(ev["part"]["text"])
+        part = ev.get("part") or {}
+        if ev.get("type") == "text" and part.get("text"):
+            texts.append(part["text"])
         elif ev.get("type") == "error":
             errors.append(json.dumps(ev.get("error"), ensure_ascii=False))
+        elif ev.get("type") == "step_finish":
+            t = part.get("tokens") or {}
+            cache = t.get("cache") or {}
+            tokens.update({"input": t.get("input") or 0, "output": t.get("output") or 0,
+                           "reasoning": t.get("reasoning") or 0, "cache_read": cache.get("read") or 0,
+                           "cache_write": cache.get("write") or 0})
 
     if timed_out:
         status = "timeout"
@@ -196,9 +280,14 @@ def run_opencode(name, preset, agents, prompt, cwd, ts):
 
     return {
         "preset": name, "status": status, "elapsed": elapsed, "rc": proc.returncode,
-        "texts": texts, "errors": errors, "log": lp,
+        "texts": texts, "errors": errors, "log": lp, "grep_note": grep_note,
+        "tokens": {k: tokens[k] for k in ("input", "output", "reasoning", "cache_read", "cache_write")},
         "_log": {"cmd": cmd, "cwd": cwd, "config": cfg, "prompt": prompt, "stdout": out, "stderr": err},
     }
+
+
+def tok(r):
+    return f"tok={r['tokens']['input']}/{r['tokens']['output']}"
 
 
 def _kill_group(proc):
@@ -222,6 +311,8 @@ def write_log(res, extra=None):
         f"# argv: {' '.join(sys.argv)}",
         f"# cmd: {' '.join(lg['cmd'])}",
         f"# cwd: {lg['cwd']}",
+        f"# tokens: {json.dumps(res['tokens'])}",
+        f"# grep: {'deny — ' + res['grep_note'] if res['grep_note'] else 'allow'}",
         "## injected OPENCODE_CONFIG_CONTENT", json.dumps(lg["config"], ensure_ascii=False, indent=2),
     ]
     if extra:
@@ -285,6 +376,28 @@ def annotate_diff(diff):
     return "\n".join(out)
 
 
+def filter_secret_diff(diff):
+    """diff에서 비밀 패턴 파일 구간을 뺀다. --uncommitted가 미추적 .env를 새 파일 diff로 넣어
+    프롬프트로 비밀이 넘어간 적이 있다(실측). (filtered, excluded_paths)"""
+    chunks, cur = [], []
+    for line in diff.splitlines(keepends=True):
+        if line.startswith("diff --git ") and cur:
+            chunks.append(cur)
+            cur = []
+        cur.append(line)
+    if cur:
+        chunks.append(cur)
+    kept, excluded = [], []
+    for c in chunks:
+        m = re.match(r"diff --git (?:\"?a/)?(.+?)\"? (?:\"?b/)?(.+?)\"?$", c[0].rstrip("\n"))
+        paths = [p for p in (m.groups() if m else ()) if p != "dev/null" and p != "/dev/null"]
+        if any(is_secret(p) for p in paths):
+            excluded.append(paths[-1])
+        else:
+            kept.append("".join(c))
+    return "".join(kept), excluded
+
+
 def collect_diff(args, top):
     sources = sum(bool(x) for x in (args.base, args.uncommitted, args.diff_file))
     if sources > 1:
@@ -339,6 +452,11 @@ def cmd_review(args, presets, agents):
     if len(set(names)) != len(names):
         raise UsageError("프리셋 중복")
     diff, source = collect_diff(args, top)
+    diff, excluded = filter_secret_diff(diff)
+    if excluded:
+        print(f"xagent review: 비밀 패턴 파일 {len(excluded)}개를 diff에서 제외: {', '.join(excluded[:5])}",
+              file=sys.stderr)
+        source += f" (비밀 패턴 파일 {len(excluded)}개 제외)"
     if not diff.strip():
         raise UsageError(f"리뷰할 diff가 비어 있음 ({source})")
     prompt = (f"{REVIEW_CONTRACT}\nDiff source: {source}\n"
@@ -381,7 +499,7 @@ def cmd_review(args, presets, agents):
         head = f"### {r['preset']}  {r['status']}"
         if r["status"] == "timeout":
             head += f"({presets[r['preset']]['timeout_sec']}s)"
-        head += f"  {r['elapsed']:.1f}s"
+        head += f"  {r['elapsed']:.1f}s  {tok(r)}"
         if r["status"] in ("ok", "no-contract-output"):
             head += f"  kept={len(r['findings']) + r['lgtm']} dropped={len(r['dropped'])}"
         print(f"\n{head}  log={r['log']}")
@@ -394,6 +512,94 @@ def cmd_review(args, presets, agents):
             print(f"(실패) {r['errors'][0][:300]}")
     return exit_code(results, any_high)
 
+
+# ---------------------------------------------------------------- task records & worktrees
+
+def record(event, **fields):
+    TASKS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps({"event": event, "at": datetime.now().isoformat(timespec="seconds"), **fields},
+                      ensure_ascii=False)
+    with open(TASKS_PATH, "a") as f:
+        f.write(line + "\n")
+
+
+def read_records():
+    if not TASKS_PATH.exists():
+        return []
+    out = []
+    for line in TASKS_PATH.read_text().splitlines():
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            pass
+    return out
+
+
+def main_toplevel():
+    """worktree 안에서 불려도 메인 작업 트리 루트를 돌려준다."""
+    r = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                       capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    if r.returncode != 0:
+        raise UsageError("git repo 안에서 실행해야 함")
+    return str(Path(r.stdout.strip()).parent)
+
+
+def xagent_worktrees(top):
+    """[(path, branch, id)] — 이 repo의 xagent worktree만."""
+    out, cur = [], {}
+    for line in git("worktree", "list", "--porcelain", cwd=top).splitlines() + [""]:
+        if not line:
+            if cur.get("worktree") and os.path.basename(cur["worktree"]).startswith(WT_PREFIX):
+                br = cur.get("branch", "").removeprefix("refs/heads/")
+                out.append((cur["worktree"], br, os.path.basename(cur["worktree"])[len(WT_PREFIX):]))
+            cur = {}
+            continue
+        k, _, v = line.partition(" ")
+        cur[k] = v
+    return out
+
+
+def find_worktree(arg, top):
+    want = os.path.abspath(arg)
+    for path, br, tid in xagent_worktrees(top):
+        if path == want or tid == arg or os.path.basename(path) == arg:
+            return path, br, tid
+    raise UsageError(f"xagent worktree를 찾을 수 없음: {arg} (xagent gc로 목록 확인)")
+
+
+def worktree_changes(wt):
+    """미추적 파일을 intent-to-add로 올린 뒤(worktree 인덱스만) 변경 파일 목록."""
+    subprocess.run(["git", "add", "-A", "-N"], cwd=wt, capture_output=True, stdin=subprocess.DEVNULL)
+    return [f for f in git("diff", "--name-only", cwd=wt, check=False).splitlines() if f]
+
+
+def remove_worktree(top, wt, branch):
+    git("worktree", "remove", "--force", wt, cwd=top, check=False)
+    if branch:
+        git("branch", "-D", branch, cwd=top, check=False)
+
+
+def create_worktree(top, name, ts):
+    tid = f"{name}-{ts}-{secrets.token_hex(2)}"
+    wt = str(Path(top).parent / f"{WT_PREFIX}{tid}")
+    branch = f"xagent/{tid}"
+    snapshot = git("diff", "HEAD", "--binary", cwd=top)
+    git("worktree", "add", "-q", wt, "-b", branch, cwd=top)
+    snap_files = 0
+    if snapshot.strip():
+        # 미커밋 tracked 변경을 base 스냅샷 커밋으로 옮긴다: worker는 현재 상태를 보고, 이후 diff엔 worker 변경만 남는다
+        r = subprocess.run(["git", "apply", "--index"], input=snapshot, cwd=wt, capture_output=True, text=True)
+        if r.returncode != 0:
+            remove_worktree(top, wt, branch)
+            raise UsageError(f"미커밋 변경을 worktree에 옮기지 못함: {r.stderr.strip()}")
+        git("-c", "user.name=xagent", "-c", "user.email=xagent@localhost", "commit", "-q", "--no-verify",
+            "-m", "xagent: base snapshot of uncommitted changes", cwd=wt)
+        snap_files = len(git("diff", "--name-only", "HEAD~1", "HEAD", cwd=wt).splitlines())
+    base = git("rev-parse", "HEAD", cwd=wt).strip()
+    return tid, wt, branch, base, snap_files
+
+
+# ---------------------------------------------------------------- commands (single / task)
 
 def cmd_single(name, prompt_arg, presets, agents):
     preset = get_preset(presets, name)
@@ -408,49 +614,165 @@ def cmd_single(name, prompt_arg, presets, agents):
     top = git_toplevel()
     cwd = os.getcwd()
     ts = timestamp()
-    wt = branch = None
     if preset["mode"] == "review":
-        prompt = f"{REVIEW_CONTRACT}\n{prompt}"
-        cwd = top or cwd
-    elif preset.get("worktree"):
+        return _single_review(name, preset, agents, f"{REVIEW_CONTRACT}\n{prompt}", top or cwd, ts)
+
+    tid = wt = branch = base = None
+    snap_files = 0
+    if preset.get("worktree"):
         if not top:
             raise UsageError("worktree 프리셋은 git repo 안에서 실행해야 함")
-        wt = str(Path(top).parent / f"wt-xagent-{name}-{ts}")
-        branch = f"xagent/{name}-{ts}"
-        git("worktree", "add", wt, "-b", branch, cwd=top)
+        tid, wt, branch, base, snap_files = create_worktree(top, name, ts)
         cwd = wt
-
-    r = run_opencode(name, preset, agents, prompt, cwd, ts)
-    if preset["mode"] == "review":
-        if r["status"] == "ok":
-            r["findings"], r["lgtm"], r["dropped"] = parse_review(r["texts"])
-            if not r["findings"] and not r["lgtm"]:
-                r["status"] = "no-contract-output"
-        else:
-            r["findings"], r["lgtm"], r["dropped"] = [], False, []
-        body = "\n".join(fmt_finding(f) for f in r["findings"]) or ("LGTM" if r["lgtm"] else "")
-        write_log(r, f"kept={len(r['findings']) + r['lgtm']} dropped={len(r['dropped'])}\n{body}\n"
-                     + "".join(f"DROPPED: {d}\n" for d in r["dropped"]) + "\n".join(r["errors"]))
-        print(f"### {name}  {r['status']}  {r['elapsed']:.1f}s  kept={len(r['findings']) + r['lgtm']} "
-              f"dropped={len(r['dropped'])}  log={r['log']}", file=sys.stderr)
-        if body:
-            print(body)
-        return exit_code([r], any(f["sev"] == "high" for f in r["findings"]))
+    r = run_opencode(name, preset, agents, TASK_PREAMBLE + prompt, cwd, ts)
 
     final = next((t for t in reversed(r["texts"]) if t.strip()), "")
     write_log(r, final + ("\n" + "\n".join(r["errors"]) if r["errors"] else ""))
-    print(f"### {name}  {r['status']}  {r['elapsed']:.1f}s  log={r['log']}", file=sys.stderr)
+    print(f"### {name}  {r['status']}  {r['elapsed']:.1f}s  {tok(r)}  log={r['log']}", file=sys.stderr)
     if final:
-        print(final)
+        if len(final) > TASK_OUTPUT_MAX:
+            print(f"(앞부분 {len(final) - TASK_OUTPUT_MAX}자 생략 — 전문은 로그)\n…{final[-TASK_OUTPUT_MAX:]}")
+        else:
+            print(final)
     elif r["errors"]:
         print(f"(실패) {r['errors'][0][:300]}", file=sys.stderr)
+
+    changed = worktree_changes(wt) if wt else []
+    record("run", id=tid or f"{name}-{ts}", preset=name, model=preset["model"], repo=top, worktree=wt,
+           branch=branch, base=base, snapshot_files=snap_files, status=r["status"],
+           elapsed=round(r["elapsed"], 1), tokens=r["tokens"], files_changed=len(changed))
     if wt:
-        subprocess.run(["git", "add", "-A", "-N"], cwd=wt, capture_output=True, stdin=subprocess.DEVNULL)
-        stat_out = git("diff", "--stat", cwd=wt, check=False).strip()
-        print(f"\n### worktree  {wt}\nbranch: {branch}  (merge하지 않음)")
-        print(stat_out or "(변경 없음)")
-        print(f"정리: git worktree remove --force {wt} && git branch -D {branch}")
+        snap = f", base에 미커밋 변경 {snap_files}개 파일 스냅샷 포함" if snap_files else ""
+        if not changed:
+            remove_worktree(top, wt, branch)
+            record("outcome", id=tid, outcome="empty", note=f"status={r['status']}")
+            print(f"\n### worktree  (변경 없음 → 자동 삭제)  id={tid}")
+        else:
+            stat_lines = git("diff", "--stat", cwd=wt, check=False).rstrip().splitlines()
+            if len(stat_lines) > STAT_MAX_LINES:
+                stat_lines = stat_lines[:STAT_MAX_LINES - 1] + [f"… ({len(stat_lines) - STAT_MAX_LINES + 1}줄 생략)",
+                                                                stat_lines[-1]]
+            print(f"\n### worktree  id={tid}\npath: {wt}{snap}")
+            print("\n".join(stat_lines))
+            print(f"검토: git -C {wt} diff\n가져오기: xagent apply {tid} [--modified]   버리기: xagent discard {tid}")
     return exit_code([r], False)
+
+
+def _single_review(name, preset, agents, prompt, cwd, ts):
+    r = run_opencode(name, preset, agents, prompt, cwd, ts)
+    if r["status"] == "ok":
+        r["findings"], r["lgtm"], r["dropped"] = parse_review(r["texts"])
+        if not r["findings"] and not r["lgtm"]:
+            r["status"] = "no-contract-output"
+    else:
+        r["findings"], r["lgtm"], r["dropped"] = [], False, []
+    body = "\n".join(fmt_finding(f) for f in r["findings"]) or ("LGTM" if r["lgtm"] else "")
+    write_log(r, f"kept={len(r['findings']) + r['lgtm']} dropped={len(r['dropped'])}\n{body}\n"
+                 + "".join(f"DROPPED: {d}\n" for d in r["dropped"]) + "\n".join(r["errors"]))
+    print(f"### {name}  {r['status']}  {r['elapsed']:.1f}s  {tok(r)}  kept={len(r['findings']) + r['lgtm']} "
+          f"dropped={len(r['dropped'])}  log={r['log']}", file=sys.stderr)
+    if body:
+        print(body)
+    return exit_code([r], any(f["sev"] == "high" for f in r["findings"]))
+
+
+# ---------------------------------------------------------------- commands (apply / discard / gc / stats)
+
+def cmd_apply(args):
+    top = main_toplevel()
+    wt, branch, tid = find_worktree(args.target, top)
+    if not worktree_changes(wt):
+        raise UsageError(f"적용할 변경이 없음: {tid} (xagent discard {tid})")
+    patch = git("diff", "--binary", cwd=wt)
+    for extra in (["--check"], []):
+        r = subprocess.run(["git", "apply", *extra], input=patch, cwd=top, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise UsageError(f"메인 트리에 적용 실패(아무것도 지우지 않음): {r.stderr.strip()}")
+    files = subprocess.run(["git", "apply", "--numstat"], input=patch, cwd=top, capture_output=True,
+                           text=True).stdout
+    outcome = "modified" if args.modified else "accepted"
+    record("outcome", id=tid, outcome=outcome, note=args.note or "")
+    remove_worktree(top, wt, branch)
+    print(f"적용 완료 ({outcome}): {tid}")
+    for line in files.splitlines():
+        add, rm, path = line.split("\t", 2)
+        print(f"  +{add} -{rm}  {path}")
+    return 0
+
+
+def cmd_discard(args):
+    top = main_toplevel()
+    wt, branch, tid = find_worktree(args.target, top)
+    record("outcome", id=tid, outcome="discarded", note=args.note or "")
+    remove_worktree(top, wt, branch)
+    print(f"버림: {tid}")
+    return 0
+
+
+def cmd_gc(args):
+    top = main_toplevel()
+    git("worktree", "prune", cwd=top, check=False)
+    decided = {e["id"] for e in read_records() if e.get("event") == "outcome"}
+    kept = []
+    for wt, branch, tid in xagent_worktrees(top):
+        changed = worktree_changes(wt)
+        if changed and not args.all:
+            kept.append((tid, wt, len(changed)))
+            continue
+        if tid not in decided:
+            record("outcome", id=tid, outcome="discarded" if changed else "empty", note="gc")
+        remove_worktree(top, wt, branch)
+        print(f"삭제: {tid}  ({'변경 ' + str(len(changed)) + '개 파일 폐기' if changed else '변경 없음'})")
+    live = {b for _, b, _ in xagent_worktrees(top)}
+    for br in git("branch", "--list", "xagent/*", "--format=%(refname:short)", cwd=top).split():
+        if br not in live:
+            git("branch", "-D", br, cwd=top, check=False)
+            print(f"고아 브랜치 삭제: {br}")
+    for tid, wt, n in kept:
+        print(f"남김(변경 {n}개 파일): {tid}  {wt}   → xagent apply|discard {tid}, 또는 gc --all")
+    return 0
+
+
+def cmd_stats():
+    events = read_records()
+    runs = {e["id"]: e for e in events if e.get("event") == "run"}
+    outcomes = {}
+    for e in events:
+        if e.get("event") == "outcome":
+            outcomes[e["id"]] = e["outcome"]
+    if not runs:
+        print(f"기록 없음 ({TASKS_PATH})")
+        return 0
+    by_preset = {}
+    for tid, e in runs.items():
+        by_preset.setdefault(e["preset"], []).append((e, outcomes.get(tid)))
+    for preset, items in sorted(by_preset.items()):
+        st = Counter(e["status"] for e, _ in items)
+        oc = Counter(o or ("pending" if e.get("worktree") else "no-worktree") for e, o in items)
+        tin = sum(e["tokens"]["input"] for e, _ in items)
+        tout = sum(e["tokens"]["output"] for e, _ in items)
+        med = statistics.median(e["elapsed"] for e, _ in items)
+        print(f"### {preset}  runs={len(items)}  median={med:.1f}s  tok_in={tin}  tok_out={tout}")
+        print(f"  status:  {dict(st)}")
+        print(f"  outcome: {dict(oc)}")
+    decided = [o for o in outcomes.values() if o in ACCEPT_DECIDED]
+    acc = sum(o in ACCEPT_ACCEPTED for o in decided)
+    rate = acc / len(decided) if decided else 0.0
+    print(f"\n수락률 = (accepted+modified)/(accepted+modified+discarded+empty) = {acc}/{len(decided)}"
+          f" = {rate:.0%}")
+    if len(decided) >= 20 and rate >= 0.7:
+        print("자동 위임 전환 기준 충족 (결정 20건 이상, 수락률 70% 이상) — 사용자에게 전환 여부를 물을 것")
+    return 0
+
+
+HELP = """\
+  xagent list
+  xagent <preset> ["<prompt>"]
+  xagent review [--base REF | --uncommitted | --diff-file PATH|-] <preset>...
+  xagent apply <id|path> [--modified] [--note TEXT]
+  xagent discard <id|path> [--note TEXT]
+  xagent gc [--all]
+  xagent stats"""
 
 
 def main():
@@ -461,19 +783,30 @@ def main():
     try:
         presets, agents = load_presets()
         if not argv or argv[0] in ("-h", "--help"):
-            print(__doc__.strip() + "\n\n  xagent list\n  xagent <preset> [\"<prompt>\"]\n"
-                  "  xagent review [--base REF | --uncommitted | --diff-file PATH|-] <preset>...")
+            print(__doc__.strip() + "\n\n" + HELP)
             return 0 if argv else 2
-        if argv[0] == "list":
+        cmd = argv[0]
+        if cmd == "list":
             return cmd_list(presets)
-        if argv[0] == "review":
-            ap = argparse.ArgumentParser(prog="xagent review")
-            ap.add_argument("--base")
-            ap.add_argument("--uncommitted", action="store_true")
-            ap.add_argument("--diff-file")
-            ap.add_argument("presets", nargs="+")
+        if cmd == "stats":
+            return cmd_stats()
+        if cmd in ("review", "apply", "discard", "gc"):
+            ap = argparse.ArgumentParser(prog=f"xagent {cmd}")
+            if cmd == "review":
+                ap.add_argument("--base")
+                ap.add_argument("--uncommitted", action="store_true")
+                ap.add_argument("--diff-file")
+                ap.add_argument("presets", nargs="+")
+            elif cmd == "gc":
+                ap.add_argument("--all", action="store_true")
+            else:
+                ap.add_argument("target")
+                ap.add_argument("--note")
+                if cmd == "apply":
+                    ap.add_argument("--modified", action="store_true")
             args = ap.parse_args(argv[1:])
-            return cmd_review(args, presets, agents)
+            return {"review": lambda: cmd_review(args, presets, agents), "apply": lambda: cmd_apply(args),
+                    "discard": lambda: cmd_discard(args), "gc": lambda: cmd_gc(args)}[cmd]()
         if len(argv) > 2:
             raise UsageError('사용법: xagent <preset> ["<prompt>"] — 프롬프트는 따옴표로 한 인자')
         return cmd_single(argv[0], argv[1] if len(argv) > 1 else None, presets, agents)
