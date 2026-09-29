@@ -140,9 +140,13 @@ def build_agent_config(preset, agents):
 def run_opencode(name, preset, agents, prompt, cwd, ts):
     """러너 1회 실행. 결과 dict 반환(status, texts, ...)."""
     cfg = build_agent_config(preset, agents)
-    cmd = ["opencode", "run", "--pure", "--format", "json", "--agent", preset["agent"], "-m", preset["model"]]
+    # opencode는 실제 cwd가 아니라 $PWD로 프로젝트 디렉터리를 정한다(실측). PWD와 --dir를 둘 다 맞추지 않으면
+    # worktree 실행이 호출한 셸의 메인 트리를 수정하고 external_directory deny도 그 기준으로 풀린다.
+    cmd = ["opencode", "run", "--pure", "--format", "json", "--dir", cwd,
+           "--agent", preset["agent"], "-m", preset["model"]]
     env = {
         **os.environ,
+        "PWD": cwd,
         "OPENCODE_CONFIG_CONTENT": json.dumps(cfg),
         "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
         "OPENCODE_DISABLE_CLAUDE_CODE_SKILLS": "1",
