@@ -1,11 +1,18 @@
 ---
 name: xagent
-description: Runs other model families (via opencode on private-network vLLM) as sub-agents through the `xagent` CLI, for cross-review and light delegated tasks. Use when the user asks for a cross-review, second opinion, or another model's review ("교차검토", "교차 검토", "크로스 리뷰", "세컨드 오피니언", "다른 모델한테 리뷰", "second opinion", "cross-review"), and before committing SQL, schema, permission, or infrastructure changes. Also use when the user asks to delegate work to xagent / opencode / a cheaper model ("opencode한테 시켜", "위임해"), and to PROPOSE delegation (ask first, one line) when a task is a clearly bounded mechanical job such as the same edit across many files, boilerplate, or test scaffolding. Do not use it for 1–2 line edits or work that needs this conversation's context.
+description: ALWAYS use this skill whenever the user's message mentions "opencode" in any form ("opencode", "OpenCode", "오픈코드", "opencode로", "opencode한테", "opencode에게", "opencode 써서", "opencode로 리뷰") — that mention means "run this through opencode via the `xagent` CLI". xagent runs other model families (opencode on private-network vLLM) as sub-agents for cross-review and light delegated tasks. Also use when the user asks for a cross-review, second opinion, or another model's review ("교차검토", "교차 검토", "크로스 리뷰", "세컨드 오피니언", "다른 모델한테 리뷰", "second opinion", "cross-review"), before committing SQL, schema, permission, or infrastructure changes, and when the user asks to delegate work to xagent or a cheaper model ("위임해"). Without such a mention, only PROPOSE delegation (ask first, one line) for clearly bounded mechanical jobs; never for 1–2 line edits or work that needs this conversation's context.
 ---
 
 # xagent — 외부 에이전트 교차검토·위임
 
 계약·종료 코드·로그 형식은 `~/xagent/README.md`에 있다. 모호하면 그 파일을 읽는다.
+
+## 0. "opencode" 언급 시
+
+사용자 메시지에 "opencode"(OpenCode, 오픈코드 포함)가 들어가면 그 작업을 xagent로 돌리라는 뜻이다. 묻지 않고 바로 진행한다.
+- 리뷰·검토·세컨드 오피니언 요청이면 **2. 교차검토**를 따른다.
+- 그 외 작업 요청이면 **4. 위임**의 "실행"과 "끝나면"을 따른다. 기준표 판정과 제안 질문은 건너뛴다.
+- 예외: opencode **자체**에 대한 질문(설치, 설정, 모델 목록, 동작 방식)이면 xagent를 실행하지 말고 답만 한다.
 
 ## 1. 프리셋 확인 (하드코딩 금지)
 
