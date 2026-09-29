@@ -75,6 +75,7 @@ xagent stats                                       # task 수락률·토큰·소
   - 변경 없는 xagent worktree를 지운다.
   - `--all`이면 변경 있는 것도 지우고, 결과가 없던 건 `discarded`(note=gc)로 기록한다.
   - worktree 없는 `xagent/*` 브랜치도 지운다.
+  - 6시간 넘은 `$TMPDIR/xagent-db-*` 임시 DB(SIGKILL 잔여물)도 지운다.
 - `stats`:
   - 프리셋별 실행 수, status, 결과 분포, 토큰 합, 소요 중앙값을 보여준다.
   - **수락률** = (accepted+modified) / (accepted+modified+discarded+empty).
@@ -125,6 +126,7 @@ env(허용 목록 + 아래 고정값만): PWD=<cwd>  OPENCODE_DB=<실행별 임�
 | `runner-error` | rc≠0 또는 `type=="error"` 이벤트 (없는 모델 rc=1/1s, 죽은 서버 rc=1/약 64s 재시도 후 — 실측) |
 | `empty-output` | 텍스트 응답 0 |
 | `no-contract-output` | review에서 계약 줄 0 — **LGTM으로 간주하지 않는다** |
+| `killed` | xagent가 SIGTERM/SIGHUP/SIGINT를 받음 (task 기록에만 나타남) |
 
 | 종료 코드 | 의미 |
 |---|---|
@@ -134,7 +136,10 @@ env(허용 목록 + 아래 고정값만): PWD=<cwd>  OPENCODE_DB=<실행별 임�
 | 3 | 일부 프리셋 실패 |
 | 4 | 모든 프리셋 실패 |
 
-우선순위: 2 > 4 > 3 > 1 > 0. `apply|discard|gc|stats`는 0 성공 / 2 오류. 타임아웃은 해당 프리셋만 실패시키고 나머지는 끝까지 기다린다. `timeout_sec`는 러너 프로세스에만 적용된다(worktree 생성 제외).
+우선순위: 2 > 4 > 3 > 1 > 0. `apply|discard|gc|stats`는 0 성공 / 2 오류.
+
+**시그널로 중단되면** 실행 중인 러너 프로세스 그룹을 종료하고 임시 DB를 지운다. task는 `status=killed`로 기록하고, 변경이 없는 worktree는 지운다(`empty`). 이후 종료 코드는 143이다. `claude -p`처럼 세션이 끝나면 백그라운드 xagent가 SIGTERM으로 죽는다(실측). SIGKILL이면 이 처리가 돌지 못하므로 `gc`가 뒷정리한다.
+ 타임아웃은 해당 프리셋만 실패시키고 나머지는 끝까지 기다린다. `timeout_sec`는 러너 프로세스에만 적용된다(worktree 생성 제외).
 
 ### 로그
 
