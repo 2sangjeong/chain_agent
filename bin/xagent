@@ -67,6 +67,23 @@ class UsageError(Exception):
     pass
 
 
+class Interrupted(Exception):
+    """SIGTERM/SIGHUP/SIGINT. 기본 동작(즉시 종료)이면 finally가 안 돌아 임시 DB·worktree가 남는다(실측)."""
+
+
+_LIVE = set()  # 실행 중인 러너 Popen (시그널 시 프로세스 그룹 종료)
+STALE_DB_SEC = 6 * 3600
+
+
+def _on_signal(signum, _frame):
+    for proc in list(_LIVE):
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    raise Interrupted(signal.Signals(signum).name)
+
+
 # ---------------------------------------------------------------- presets
 
 def load_presets():
@@ -237,16 +254,22 @@ def run_opencode(name, preset, agents, prompt, cwd, ts):
     env["OPENCODE_DB"] = os.path.join(dbdir, "opencode.db")
     start = time.monotonic()
     timed_out = False
+    proc = None
     try:
         proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True, start_new_session=True)
+        _LIVE.add(proc)
         try:
             out, err = proc.communicate(prompt, timeout=preset["timeout_sec"])
         except subprocess.TimeoutExpired:
             timed_out = True
             _kill_group(proc)
             out, err = proc.communicate()
+        except Interrupted:
+            _kill_group(proc)
+            raise
     finally:
+        _LIVE.discard(proc)
         shutil.rmtree(dbdir, ignore_errors=True)
     elapsed = time.monotonic() - start
 
@@ -624,7 +647,19 @@ def cmd_single(name, prompt_arg, presets, agents):
             raise UsageError("worktree 프리셋은 git repo 안에서 실행해야 함")
         tid, wt, branch, base, snap_files = create_worktree(top, name, ts)
         cwd = wt
-    r = run_opencode(name, preset, agents, TASK_PREAMBLE + prompt, cwd, ts)
+    try:
+        r = run_opencode(name, preset, agents, TASK_PREAMBLE + prompt, cwd, ts)
+    except Interrupted as e:
+        changed = worktree_changes(wt) if wt else []
+        record("run", id=tid or f"{name}-{ts}", preset=name, model=preset["model"], repo=top, worktree=wt,
+               branch=branch, base=base, snapshot_files=snap_files, status="killed", signal=str(e),
+               elapsed=None, tokens=None, files_changed=len(changed))
+        if wt and not changed:
+            remove_worktree(top, wt, branch)
+            record("outcome", id=tid, outcome="empty", note=f"killed by {e}")
+        elif wt:
+            print(f"xagent: 중단됨 — 변경 있는 worktree는 남김: {tid}", file=sys.stderr)
+        raise
 
     final = next((t for t in reversed(r["texts"]) if t.strip()), "")
     write_log(r, final + ("\n" + "\n".join(r["errors"]) if r["errors"] else ""))
@@ -712,6 +747,14 @@ def cmd_discard(args):
 def cmd_gc(args):
     top = main_toplevel()
     git("worktree", "prune", cwd=top, check=False)
+    # SIGKILL로 죽은 실행이 남긴 임시 DB (진행 중인 실행과 겹치지 않게 오래된 것만)
+    for d in Path(tempfile.gettempdir()).glob("xagent-db-*"):
+        try:
+            if time.time() - d.stat().st_mtime > STALE_DB_SEC:
+                shutil.rmtree(d, ignore_errors=True)
+                print(f"오래된 임시 DB 삭제: {d}")
+        except OSError:
+            pass
     decided = {e["id"] for e in read_records() if e.get("event") == "outcome"}
     kept = []
     for wt, branch, tid in xagent_worktrees(top):
@@ -749,9 +792,10 @@ def cmd_stats():
     for preset, items in sorted(by_preset.items()):
         st = Counter(e["status"] for e, _ in items)
         oc = Counter(o or ("pending" if e.get("worktree") else "no-worktree") for e, o in items)
-        tin = sum(e["tokens"]["input"] for e, _ in items)
-        tout = sum(e["tokens"]["output"] for e, _ in items)
-        med = statistics.median(e["elapsed"] for e, _ in items)
+        tin = sum((e.get("tokens") or {}).get("input", 0) for e, _ in items)
+        tout = sum((e.get("tokens") or {}).get("output", 0) for e, _ in items)
+        times = [e["elapsed"] for e, _ in items if e.get("elapsed") is not None]
+        med = statistics.median(times) if times else 0.0
         print(f"### {preset}  runs={len(items)}  median={med:.1f}s  tok_in={tin}  tok_out={tout}")
         print(f"  status:  {dict(st)}")
         print(f"  outcome: {dict(oc)}")
@@ -779,6 +823,8 @@ def main():
     if os.environ.get("XAGENT_DEPTH"):
         print("xagent: 재귀 호출 거부 (XAGENT_DEPTH 설정됨)", file=sys.stderr)
         return 2
+    for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(s, _on_signal)
     argv = sys.argv[1:]
     try:
         presets, agents = load_presets()
@@ -813,6 +859,9 @@ def main():
     except UsageError as e:
         print(f"xagent: {e}", file=sys.stderr)
         return 2
+    except Interrupted as e:
+        print(f"xagent: {e}로 중단됨 (러너 종료·임시 DB 삭제·기록 완료)", file=sys.stderr)
+        return 143
 
 
 if __name__ == "__main__":
