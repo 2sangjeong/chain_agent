@@ -59,7 +59,8 @@ secret_allow:
 #                read-only: agent의 edit·bash가 deny여야 함. review 모드는 read-only만 허용.
 #   worktree     bool. task 모드에서 true면 ../wt-xagent-<id> worktree에서 실행 (id = <preset>-<ts>-<rand4>)
 #   timeout_sec  runner 프로세스 벽시계 상한(초). 초과 시 해당 프리셋만 실패
-#   description  (선택) 목록 표시용
+#   description  (선택) 목록 표시용. `xagent task --model`이 이 문자열도 검색한다
+#   default      (선택) bool. `xagent task`가 쓸 기본 task 프리셋. task 프리셋 중 정확히 하나
 #
 # 모델은 opencode.json에 등록된 사설망 GPU 팜 vLLM(10.233.60.61)만 쓴다. 외부 인터넷으로 나가지 않는지는 미검증.
 # opencode/*-free 외부 모델(opencode.ai 경유)은 의도적으로 제외.
@@ -86,6 +87,7 @@ presets:
 
   cheap-task:
     description: 가벼운 위임 작업(기본) — GLM 5.3 Flash, 별도 worktree에서 실행
+    default: true
     runner: opencode
     model: vllm-glm/glm-5.3-flash
     agent: worker

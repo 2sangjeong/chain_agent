@@ -16,12 +16,17 @@ Claude Code에서 외부 코딩 에이전트를 서브에이전트로 호출하�
 ```
 xagent list                                        # 프리셋 목록 (YAML에서 읽음)
 xagent <preset> ["<prompt>"]                       # 단일 실행
-xagent review [--base REF | --uncommitted | --diff-file PATH|-] <preset> [<preset>...]
+xagent task [--model SUBSTR] ["<prompt>"]          # 기본 task 프리셋(default: true)으로 실행. --model은 아래 참고
+xagent review [--base REF | --uncommitted | --diff-file PATH|-] (--all | <preset> [<preset>...])
 xagent apply <id|worktree경로> [--modified] [--note TEXT]   # worktree 변경을 메인 트리에 적용 + 기록 + 정리
 xagent discard <id|worktree경로> [--note TEXT]              # 버림 + 기록 + 정리
 xagent gc [--all]                                  # 현재 repo의 xagent worktree 정리
 xagent stats                                       # task 수락률·토큰·소요시간 집계
 ```
+
+- `task`, `review --all`은 프리셋 이름을 몰라도 되게 해 `xagent list` 호출(= Claude 턴 1회)을 없앤다.
+  - `task --model SUBSTR`: task 프리셋 중 이름·description·model에 SUBSTR(대소문자 무시)이 든 것 하나를 고른다(예: `--model qwen`). 0개나 2개 이상이면 사용 오류.
+  - `review --all`: `mode: review` 프리셋 전부. 프리셋 이름과 함께 쓰면 사용 오류.
 
 `<id>`는 `<preset>-<YYYYmmdd-HHMMSS>-<rand4>`. worktree는 `../wt-xagent-<id>`, 브랜치는 `xagent/<id>`.
 `apply|discard|gc`는 대상 repo(메인 작업 트리) 안에서 실행한다.
