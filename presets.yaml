@@ -32,8 +32,8 @@ opencode:
         external_directory: deny
 
 # 비밀 파일 패턴. xagent가 모든 agent의 read 권한에 deny로 강제 주입한다.
-# grep 도구는 read 규칙을 따르지 않지만 .gitignore된 파일은 건너뛴다(실측).
-# 그래서 실행 전 git에서 "gitignore되지 않은" 이 패턴 파일이 보이면 그 실행에서 grep도 deny한다.
+# grep 도구는 read 규칙을 따르지 않고, include 글롭으로 .gitignore도 우회된다(실측).
+# 그래서 실행 전 작업 트리에 이 패턴 파일이 하나라도 있으면(ignore 여부 무관) 그 실행에서 grep도 deny한다.
 secret_patterns:
   - "*.env"
   - "*.env.*"

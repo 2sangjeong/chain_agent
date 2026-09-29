@@ -36,6 +36,8 @@ xagent stats                                       # task 수락률·토큰·소
   - `--uncommitted`: `git diff HEAD`(스테이지+미스테이지) + 미추적 파일(`--exclude-standard`)을 새 파일 diff로 추가. 인덱스는 건드리지 않는다.
   - `--diff-file PATH`: 파일에서 읽는다. `-`는 stdin.
 
+  어느 소스든 `secret_patterns`에 걸리는 파일 구간은 diff에서 빼고 stderr에 알린다. 미추적 `.env`가 `--uncommitted` diff로 프롬프트에 들어간 적이 있다(실측).
+
   diff가 비면 모델을 부르지 않고 사용 오류로 끝낸다.
 - 러너에게는 항상 프롬프트를 **stdin으로** 넘긴다(argv 128KB 한도 회피, 200KB 실측). 입력이 없으면 `/dev/null`을 준다.
 
@@ -87,9 +89,9 @@ xagent stats                                       # task 수락률·토큰·소
 ### 격리
 
 - **비밀 파일**: `presets.yaml`의 `secret_patterns`를 모든 agent의 `read` 권한에 deny로 강제한다(`secret_allow`는 예외 허용).
-  - grep 도구는 read 규칙을 따르지 않지만 `.gitignore`된 파일은 건너뛴다(실측).
-  - 그래서 실행 전 `git ls-files -co --exclude-standard`에 비밀 패턴 파일이 보이면 **그 실행에서 grep을 deny**하고 stderr와 로그에 알린다.
-  - git repo가 아닌 곳에서도 grep을 deny한다.
+  - grep 도구는 read 규칙을 따르지 않는다. `.gitignore`는 존중하지만, 모델이 `include` 글롭을 주면 ripgrep `--glob`가 ignore 규칙을 덮어써 gitignore된 `.env`도 읽힌다(실측).
+  - 그래서 실행 전 작업 트리(`.git` 제외)를 훑어 비밀 패턴 파일이 **하나라도 있으면**(ignore 여부 무관) 그 실행에서 grep을 deny하고 stderr와 로그에 알린다.
+  - 이 경우 모델은 glob·read로만 탐색한다. crypto-bot처럼 `.env`·`*.db`가 있는 repo에서는 grep이 항상 꺼진다.
 - **하위 에이전트 금지**: 모든 agent에 `task: deny`, `webfetch: deny`, `external_directory: deny`를 강제한다. `task`가 열리면 모델이 제한을 물려받지 않는 하위 에이전트를 띄워 `.env`·DB를 읽었다(실측).
 - **worker 셸 금지**: `bash: deny`.
 - **환경변수 허용 목록**: 러너에는 다음만 넘긴다.
