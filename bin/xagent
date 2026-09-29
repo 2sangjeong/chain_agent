@@ -99,6 +99,9 @@ def load_presets():
         raise UsageError("presets.yaml에 secret_patterns가 없음 (비밀 파일 차단은 필수)")
     for name, p in presets.items():
         validate_preset(name, p, agents)
+    defaults = [n for n, p in presets.items() if p.get("default")]
+    if any(presets[n]["mode"] != "task" for n in defaults) or len(defaults) > 1:
+        raise UsageError(f"default: true는 task 프리셋 하나에만 (현재: {defaults})")
     return presets, agents
 
 
@@ -447,9 +450,24 @@ def collect_diff(args, top):
 
 # ---------------------------------------------------------------- commands
 
+def resolve_task_preset(presets, model):
+    tasks = {n: p for n, p in presets.items() if p["mode"] == "task"}
+    if model:
+        q = model.lower()
+        hits = [n for n, p in tasks.items()
+                if q in n.lower() or q in p["model"].lower() or q in p.get("description", "").lower()]
+        if len(hits) != 1:
+            raise UsageError(f"--model {model}: task 프리셋 {len(hits)}개 일치 {hits} (정확히 1개여야 함)")
+        return hits[0]
+    defaults = [n for n, p in tasks.items() if p.get("default")]
+    if not defaults:
+        raise UsageError("default: true인 task 프리셋이 없음 (presets.yaml)")
+    return defaults[0]
+
+
 def cmd_list(presets):
     for name, p in presets.items():
-        wt = " worktree" if p.get("worktree") else ""
+        wt = (" worktree" if p.get("worktree") else "") + (" [default]" if p.get("default") else "")
         print(f"{name:<16} {p['mode']:<6} {p['model']:<28} {p['agent']}/{p['permissions']}{wt} "
               f"timeout={p['timeout_sec']}s  {p.get('description', '')}")
     return 0
@@ -468,7 +486,11 @@ def cmd_review(args, presets, agents):
     top = git_toplevel()
     if not top:
         raise UsageError("git repo 안에서 실행해야 함")
-    names = args.presets
+    if args.all and args.presets:
+        raise UsageError("--all과 프리셋 이름을 같이 쓸 수 없음")
+    names = [n for n, p in presets.items() if p["mode"] == "review"] if args.all else args.presets
+    if not names:
+        raise UsageError("review 프리셋을 지정하거나 --all")
     for n in names:
         if get_preset(presets, n)["mode"] != "review":
             raise UsageError(f"'{n}'는 review 프리셋이 아님")
@@ -834,7 +856,8 @@ def cmd_stats():
 HELP = """\
   xagent list
   xagent <preset> ["<prompt>"]
-  xagent review [--base REF | --uncommitted | --diff-file PATH|-] <preset>...
+  xagent task [--model SUBSTR] ["<prompt>"]
+  xagent review [--base REF | --uncommitted | --diff-file PATH|-] (--all | <preset>...)
   xagent apply <id|path> [--modified] [--note TEXT]
   xagent discard <id|path> [--note TEXT]
   xagent gc [--all]
@@ -858,13 +881,22 @@ def main():
             return cmd_list(presets)
         if cmd == "stats":
             return cmd_stats()
+        if cmd == "task":
+            ap = argparse.ArgumentParser(prog="xagent task")
+            ap.add_argument("--model")
+            ap.add_argument("prompt", nargs="?")
+            args = ap.parse_args(argv[1:])
+            name = resolve_task_preset(presets, args.model)
+            print(f"xagent task → {name}", file=sys.stderr)
+            return cmd_single(name, args.prompt, presets, agents)
         if cmd in ("review", "apply", "discard", "gc"):
             ap = argparse.ArgumentParser(prog=f"xagent {cmd}")
             if cmd == "review":
                 ap.add_argument("--base")
                 ap.add_argument("--uncommitted", action="store_true")
                 ap.add_argument("--diff-file")
-                ap.add_argument("presets", nargs="+")
+                ap.add_argument("--all", action="store_true")
+                ap.add_argument("presets", nargs="*")
             elif cmd == "gc":
                 ap.add_argument("--all", action="store_true")
             else:
