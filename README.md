@@ -57,7 +57,7 @@ xagent stats                                       # task 수락률·토큰·소
 - `worktree: true`면 git toplevel에서 `git worktree add ../wt-xagent-<id> -b xagent/<id>`(HEAD 기준)를 만들고, 그 안에서 실행한다.
   - `<id>`에 4자리 난수를 붙여 같은 초에 병렬로 띄워도 충돌하지 않는다.
   - **base 스냅샷**: 메인 트리에 커밋 안 된 **tracked** 변경(`git diff HEAD`)이 있으면 worktree에 적용해 `xagent: base snapshot` 커밋으로 만든다. worker는 현재 상태를 보고 작업하고, 이후 diff에는 worker 변경만 남는다. 미추적 파일은 넘어가지 않는다.
-  - 종료 후 worktree 안에서 `git add -N`(worktree 인덱스만)을 한 뒤 `git diff --stat`(최대 40줄), id, worktree 경로를 출력한다.
+  - 종료 시 worker 변경을 `xagent: worker changes` 커밋으로 **고정**하고, `git diff --stat HEAD~1 HEAD`(최대 40줄), id, worktree 경로를 출력한다. 고정 이후 worktree에 생긴 변경(호출자가 돌린 테스트의 `__pycache__` 등)은 apply에 들어가지 않는다. 고정하지 않았을 때 apply에 테스트 산출물이 섞인 적이 있다(실측).
   - **변경이 없으면 worktree와 브랜치를 자동 삭제**하고 결과를 `empty`로 기록한다. 변경이 있으면 남겨 둔다.
   - **merge는 하지 않는다.** 가져오기는 `xagent apply`, 버리기는 `xagent discard`.
 - worker는 셸이 없다. 테스트 실행은 호출자가 worktree에서 한다. xagent는 이 사실을 task 프롬프트 앞에 붙인다.
@@ -67,12 +67,12 @@ xagent stats                                       # task 수락률·토큰·소
 ### apply / discard / gc / stats
 
 - `apply`:
-  1. worktree 변경(`git diff --binary`, base 스냅샷 이후분)을 메인 toplevel에 `git apply`한다(`--check` 선행).
+  1. 고정된 worker 커밋(`git diff --binary HEAD~1 HEAD`)을 메인 toplevel에 `git apply`한다(`--check` 선행).
   2. 성공하면 결과를 `accepted`(`--modified`면 `modified`)로 기록하고 worktree와 브랜치를 지운다.
   3. 적용이 실패하면 아무것도 지우지 않고 종료 코드 2.
 - `discard`: `discarded`로 기록하고 지운다.
 - `gc`:
-  - 변경 없는 xagent worktree를 지운다.
+  - 변경(worker 커밋 또는 고정 못 한 잔여 변경) 없는 xagent worktree를 지운다.
   - `--all`이면 변경 있는 것도 지우고, 결과가 없던 건 `discarded`(note=gc)로 기록한다.
   - worktree 없는 `xagent/*` 브랜치도 지운다.
   - 6시간 넘은 `$TMPDIR/xagent-db-*` 임시 DB(SIGKILL 잔여물)도 지운다.
