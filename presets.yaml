@@ -64,8 +64,8 @@ secret_allow:
 # 모델은 opencode.json에 등록된 사설망 GPU 팜 vLLM(10.233.60.61)만 쓴다. 외부 인터넷으로 나가지 않는지는 미검증.
 # opencode/*-free 외부 모델(opencode.ai 경유)은 의도적으로 제외.
 presets:
-  review-gemma:
-    description: 교차검토 — Gemma 4 31B (사설망 vLLM, 구글 오픈웨이트 계열)
+  review-qwen:
+    description: 교차검토 — Qwen3.8 Flash (사설망 vLLM, Alibaba 계열. opencode 모델 ID는 vllm/gemma-4-31b지만 실제는 Qwen)
     runner: opencode
     model: vllm/gemma-4-31b
     agent: reviewer
@@ -85,7 +85,7 @@ presets:
     timeout_sec: 300
 
   cheap-task:
-    description: 가벼운 위임 작업 — GLM 5.3 Flash, 별도 worktree에서 실행
+    description: 가벼운 위임 작업(기본) — GLM 5.3 Flash, 별도 worktree에서 실행
     runner: opencode
     model: vllm-glm/glm-5.3-flash
     agent: worker
@@ -93,3 +93,13 @@ presets:
     permissions: workspace-write
     worktree: true
     timeout_sec: 540   # Bash 도구 상한 600s보다 짧게: xagent 자체 타임아웃이 먼저 걸려야 정리·기록된다
+
+  cheap-task-qwen:
+    description: 가벼운 위임 작업 — Qwen3.8 Flash, 별도 worktree에서 실행
+    runner: opencode
+    model: vllm/gemma-4-31b
+    agent: worker
+    mode: task
+    permissions: workspace-write
+    worktree: true
+    timeout_sec: 540

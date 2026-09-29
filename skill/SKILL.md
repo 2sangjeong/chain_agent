@@ -13,6 +13,7 @@ description: ALWAYS use this skill whenever the user's message mentions "opencod
 - 리뷰·검토·세컨드 오피니언 요청이면 **2. 교차검토**를 따른다.
 - 그 외 작업 요청이면 **4. 위임**의 "실행"과 "끝나면"을 따른다. 기준표 판정과 제안 질문은 건너뛴다.
 - 예외: opencode **자체**에 대한 질문(설치, 설정, 모델 목록, 동작 방식)이면 xagent를 실행하지 말고 답만 한다.
+- 모델까지 지정했으면("opencode qwen으로") 4. 위임의 '모델 고르기'를 따른다.
 
 ## 1. 프리셋 확인 (하드코딩 금지)
 
@@ -61,6 +62,12 @@ Bash 도구 `timeout`은 프리셋 `timeout_sec` 최대값보다 길게 준다(�
 | 대화 맥락 없이 지시 10줄로 완결됨 | 대상 파일을 이미 읽었음 |
 | 테스트나 grep으로 결과를 기계 검증할 수 있음 | 도메인 규칙 판단 필요(CLAUDE.md 절대 규칙, 스키마, 권한, 실거래 로직) |
 | 예상 diff 300줄 이하 | 검증 기준이 없음 |
+
+### 모델 고르기
+- 기본은 GLM 프리셋(`xagent list`에서 description에 '(기본)'이 붙은 task 프리셋)이다.
+- 사용자가 모델을 지정하면("qwen으로", "glm으로") description에 그 모델명이 든 task 프리셋을 쓴다.
+- **같이 쓰기**: 중요하거나 답이 여러 갈래일 수 있는 작업은 task 프리셋 둘에 같은 지시를 병렬로 맡긴다(각각 `run_in_background`). 두 diff를 비교해 나은 쪽만 `xagent apply`, 다른 쪽은 `xagent discard <id> --note "compared: <채택 id>에 밀림 — <이유>"`로 기록한다. Claude가 diff를 두 번 읽어 비용이 두 배이므로 단순 반복 작업에는 쓰지 않는다.
+- 기본 모델을 바꾸는 판단은 `xagent stats`의 프리셋별 수락률이 쌓인 뒤 사용자에게 제안만 한다.
 
 ### 실행
 ```bash
