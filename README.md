@@ -55,11 +55,12 @@ xagent review [--base REF | --uncommitted | --diff-file PATH|-] <preset> [<prese
 
 ```
 opencode run --pure --format json --dir <cwd> --agent <agent> -m <model>   < prompt
-env: PWD=<cwd>  OPENCODE_CONFIG_CONTENT=<agent 정의 JSON>  OPENCODE_DISABLE_PROJECT_CONFIG=1
+env: PWD=<cwd>  OPENCODE_DB=<실행별 임시 DB>  OPENCODE_CONFIG_CONTENT=<agent 정의 JSON>  OPENCODE_DISABLE_PROJECT_CONFIG=1
      OPENCODE_DISABLE_CLAUDE_CODE_SKILLS=1  OPENCODE_DISABLE_AUTOUPDATE=1  XAGENT_DEPTH=1
 ```
 
 - `PWD`와 `--dir`를 실행 디렉터리로 맞춘다: opencode는 실제 cwd가 아니라 `$PWD`로 프로젝트 디렉터리를 정한다. 안 맞추면 worktree task가 호출한 셸의 메인 트리를 수정한다(2026-09-29 Phase 3 실측 사고).
+- `OPENCODE_DB`는 실행마다 임시 파일로 주고 끝나면 지운다. 공유 `opencode.db`는 병렬 기동 시 `database is locked`로 간헐 실패했다(Phase 3 #6 실측). 세션은 opencode UI에 남지 않으며, 원문은 xagent 로그에 있다.
 - `--agent` 항상 명시: 생략 시 플러그인 기본 agent(Sisyphus, `*: allow`)로 떨어진다.
 - `--pure`: 없으면 oh-my-openagent 플러그인이 cwd에 `.omo/`를 쓴다(reviewer도).
 - `--format json`: 최종 답은 `type=="text"` 이벤트의 `part.text`. 기본 포맷은 도구 에러로 끝난 턴에서 빈 출력이 나온 적이 있다.
