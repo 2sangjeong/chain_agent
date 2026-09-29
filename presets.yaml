@@ -1,0 +1,84 @@
+# xagent 프리셋 — 단일 소스.
+# xagent 스크립트와 Claude Code 스킬은 여기의 프리셋 이름만 참조한다.
+# 설치 경로: ~/.config/xagent/presets.yaml (-> ~/xagent/presets.yaml symlink)
+# 테스트용 대체 파일: XAGENT_PRESETS=/path/to/presets.yaml
+version: 1
+
+# opencode agent 정의. xagent가 실행 시 OPENCODE_CONFIG_CONTENT 로 주입한다.
+# 전역 ~/.config/opencode/opencode.json 은 수정하지 않으며, 주입된 정의는
+# xagent 실행에서만 존재한다. 규칙은 opencode 기본 규칙 뒤에 붙고 뒤가 이긴다
+# (2026-09-29 실측: deny 도구는 모델 도구 목록에서 제거됨, 비대화형 "ask"는 자동 거부).
+opencode:
+  agents:
+    reviewer:
+      mode: primary
+      description: xagent read-only reviewer (no edit, no bash, no network, no subagents)
+      permission:
+        edit: deny
+        bash: deny
+        webfetch: deny
+        task: deny
+        external_directory: deny
+    worker:
+      mode: primary
+      description: xagent worker (edits allowed inside its directory; bash allow-list only)
+      permission:
+        edit: allow
+        webfetch: deny
+        task: deny
+        external_directory: deny
+        # bash는 허용 목록만. "*" 허용 금지, xagent 재귀 호출 가능한 명령 금지.
+        # 주의: pytest 등은 임의 코드를 실행한다. worktree 격리는 git 격리이지 보안 격리가 아니다.
+        bash:
+          "*": deny
+          "git status*": allow
+          "git diff*": allow
+          "git log*": allow
+          "git show*": allow
+          "ls*": allow
+          "pytest*": allow
+          "python3 -m pytest*": allow
+
+# 프리셋 필드
+#   runner       opencode            (codex|kiro는 스키마 예약, 현재 미지원 -> 설정 오류)
+#   model        provider/model      (`opencode models`로 확인된 값만)
+#   agent        위 opencode.agents 의 키
+#   mode         review | task
+#   permissions  read-only | workspace-write
+#                agent 권한과의 일치를 xagent가 검증하는 라벨.
+#                read-only: agent의 edit·bash가 deny여야 함. review 모드는 read-only만 허용.
+#   worktree     bool. task 모드에서 true면 ../wt-xagent-<preset>-<ts> worktree에서 실행
+#   timeout_sec  runner 프로세스 벽시계 상한(초). 초과 시 해당 프리셋만 실패
+#   description  (선택) 목록 표시용
+#
+# 모델은 로컬 vLLM만 쓴다(코드가 외부로 나가지 않음). opencode/*-free 외부 모델은 의도적으로 제외.
+presets:
+  review-gemma:
+    description: 교차검토 — Gemma 4 31B (로컬 vLLM, 구글 오픈웨이트 계열)
+    runner: opencode
+    model: vllm/gemma-4-31b
+    agent: reviewer
+    mode: review
+    permissions: read-only
+    worktree: false
+    timeout_sec: 300
+
+  review-glm:
+    description: 교차검토 — GLM 5.3 Flash (로컬 vLLM, Zhipu 계열)
+    runner: opencode
+    model: vllm-glm/glm-5.3-flash
+    agent: reviewer
+    mode: review
+    permissions: read-only
+    worktree: false
+    timeout_sec: 300
+
+  cheap-task:
+    description: 가벼운 위임 작업 — GLM 5.3 Flash, 별도 worktree에서 실행
+    runner: opencode
+    model: vllm-glm/glm-5.3-flash
+    agent: worker
+    mode: task
+    permissions: workspace-write
+    worktree: true
+    timeout_sec: 600
